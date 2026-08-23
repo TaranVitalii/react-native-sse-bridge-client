@@ -68,7 +68,7 @@ stream.destroy()
 
 Creates a new, independent stream. Classic Native Modules are singletons, so unlike a plain JSI HybridObject there's only ever one native module underneath — but every `SSEStream` you create gets its own connection, its own listeners, and its own lifecycle. Create as many as you need; they share the native connection pool, so reconnecting one doesn't disturb the others.
 
-### `configureSession(options: SSESessionOptions): void`
+### `configureSSESession(options: SSESessionOptions): void`
 
 Sets the shared session config (timeout, max connections per host) once, up front. Call this at app startup, before any screen creates/connects a stream — see [Configuring the shared session](#configuring-the-shared-session) below.
 
@@ -120,13 +120,13 @@ interface SSESessionOptions {
 
 The underlying `URLSession`/`OkHttpClient` is shared by every `SSEStream` in the app and, once created, kept alive for the app's lifetime — that's the whole mechanism behind connection reuse. Because of that, this config only takes effect once, on whichever `connect()` call ends up being the very first one made across the whole app; after that, the shared client already exists and any further attempt to set it is a no-op.
 
-Rather than relying on "whichever stream happens to connect first" and passing `session` there, call `configureSession()` once at app startup — e.g. at the top of `App.tsx`, before any screen creates a stream:
+Rather than relying on "whichever stream happens to connect first" and passing `session` there, call `configureSSESession()` once at app startup — e.g. at the top of `App.tsx`, before any screen creates a stream:
 
 ```ts
 // App.tsx
-import { configureSession } from 'react-native-sse-bridge-client'
+import { configureSSESession } from 'react-native-sse-bridge-client'
 
-configureSession({ timeoutSeconds: 1800, maxConnectionsPerHost: 4 })
+configureSSESession({ timeoutSeconds: 1800, maxConnectionsPerHost: 4 })
 
 export default function App() {
   // screens create/connect their own streams from here on, all sharing this config
@@ -137,7 +137,7 @@ export default function App() {
 Every stream's `connect()` then picks this up automatically as its default. You can still pass `session` directly to a particular `connect()` call if you want that one call to override the app-wide default (it only actually applies if that call turns out to be the first one, same rule as above — a `console.warn` fires if it doesn't).
 
 ```ts
-// lower-level escape hatch — same one-time-effect caveat as configureSession()
+// lower-level escape hatch — same one-time-effect caveat as configureSSESession()
 stream.connect(url, {
   session: { timeoutSeconds: 1800, maxConnectionsPerHost: 4 },
 })

@@ -31,7 +31,7 @@ export interface SSEConnectionMetrics {
  * effect once, on whichever connect() call ends up being the very first one made across ALL
  * streams in the app; after that, the shared client already exists and this is ignored
  * (recreating it would defeat the whole point — every connection already in the pool would be
- * dropped). Prefer configureSession() over passing `session` to connect() directly — it removes
+ * dropped). Prefer configureSSESession() over passing `session` to connect() directly — it removes
  * the guesswork of "which stream connects first" by setting this once, up front, at app startup.
  */
 export interface SSESessionOptions {
@@ -58,8 +58,8 @@ let nextStreamId = 0;
 // created lazily on that very first call, so this is the JS-side mirror of "does the session
 // already exist" used to warn when a later connect()'s `session` options can't take effect.
 let sharedSessionCreated = false;
-// Set by configureSession(), applied to whichever connect() call ends up being the first one
-// across the app — see configureSession() below.
+// Set by configureSSESession(), applied to whichever connect() call ends up being the first one
+// across the app — see configureSSESession() below.
 let defaultSessionOptions: SSESessionOptions | undefined;
 
 /**
@@ -72,12 +72,12 @@ let defaultSessionOptions: SSESessionOptions | undefined;
  * created lazily on that call, so calling this any later has nothing left to configure and
  * logs a warning instead of silently doing nothing.
  */
-export function configureSession(options: SSESessionOptions): void {
+export function configureSSESession(options: SSESessionOptions): void {
   if (sharedSessionCreated) {
     console.warn(
-      '[react-native-sse-bridge-client] configureSession() was called after a stream had already ' +
+      '[react-native-sse-bridge-client] configureSSESession() was called after a stream had already ' +
         'connected — the shared session/client already exists, so these options have no effect. ' +
-        'Call configureSession() once at app startup, before creating or connecting any SSEStream.',
+        'Call configureSSESession() once at app startup, before creating or connecting any SSEStream.',
     );
     return;
   }
@@ -198,7 +198,7 @@ export class SSEStream {
     if (this.destroyed) {
       throw new Error('SSEStream has been destroyed');
     }
-    // An explicit `session` on this call wins; otherwise fall back to whatever configureSession()
+    // An explicit `session` on this call wins; otherwise fall back to whatever configureSSESession()
     // set at app startup, if anything.
     const session = options?.session ?? defaultSessionOptions;
     // Only warn when THIS call explicitly passed `session` and it's too late for it to apply —
@@ -209,7 +209,7 @@ export class SSEStream {
         '[react-native-sse-bridge-client] `session` options were ignored: the shared session/client ' +
           'was already created by an earlier connect() call (on this or another SSEStream). Session ' +
           'config only takes effect on the very first connect() made across the whole app — call ' +
-          'configureSession() once at startup instead. See the README for details.',
+          'configureSSESession() once at startup instead. See the README for details.',
       );
     }
     sharedSessionCreated = true;
