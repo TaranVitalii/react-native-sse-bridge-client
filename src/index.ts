@@ -27,10 +27,12 @@ export interface SSEConnectionMetrics {
 /**
  * The underlying URLSession (iOS) / OkHttpClient (Android) is shared by every SSEStream and,
  * once created, kept alive for the app's lifetime — that's what lets a reconnect reuse the
- * pooled HTTP/2 connection instead of re-handshaking. Because of that, `session` only takes
- * effect on the very first connect() call made across ALL streams in the app; once that shared
- * client exists, later streams' `session` options are silently ignored (recreating it would
- * defeat the whole point — every connection already in the pool would be dropped).
+ * pooled HTTP/2 connection instead of re-handshaking. Because of that, this config only takes
+ * effect once, on whichever connect() call ends up being the very first one made across ALL
+ * streams in the app; after that, the shared client already exists and this is ignored
+ * (recreating it would defeat the whole point — every connection already in the pool would be
+ * dropped). Prefer configureSession() over passing `session` to connect() directly — it removes
+ * the guesswork of "which stream connects first" by setting this once, up front, at app startup.
  */
 export interface SSESessionOptions {
   /** Request timeout in seconds. Defaults to 3600 on iOS, unlimited (0) on Android. */
@@ -56,6 +58,31 @@ let nextStreamId = 0;
 // created lazily on that very first call, so this is the JS-side mirror of "does the session
 // already exist" used to warn when a later connect()'s `session` options can't take effect.
 let sharedSessionCreated = false;
+// Set by configureSession(), applied to whichever connect() call ends up being the first one
+// across the app — see configureSession() below.
+let defaultSessionOptions: SSESessionOptions | undefined;
+
+/**
+ * Sets the shared session config (timeout, max connections per host) once, up front — call this
+ * at app startup (e.g. in App.tsx, before any screen creates/connects a stream) instead of
+ * passing `session` to whichever connect() happens to run first. Every stream's connect() then
+ * uses this as its default (an explicit `session` passed to connect() still wins for that call).
+ *
+ * Must be called before the first connect() anywhere in the app — the underlying session is
+ * created lazily on that call, so calling this any later has nothing left to configure and
+ * logs a warning instead of silently doing nothing.
+ */
+export function configureSession(options: SSESessionOptions): void {
+  if (sharedSessionCreated) {
+    console.warn(
+      '[react-native-sse-bridge-client] configureSession() was called after a stream had already ' +
+        'connected — the shared session/client already exists, so these options have no effect. ' +
+        'Call configureSession() once at app startup, before creating or connecting any SSEStream.',
+    );
+    return;
+  }
+  defaultSessionOptions = options;
+}
 
 // SSE frames with no `event:` field are filed under this key, matching how browser
 // EventSource treats them as type 'message'.
@@ -171,18 +198,22 @@ export class SSEStream {
     if (this.destroyed) {
       throw new Error('SSEStream has been destroyed');
     }
-    if (options?.session && sharedSessionCreated) {
+    // An explicit `session` on this call wins; otherwise fall back to whatever configureSession()
+    // set at app startup, if anything.
+    const session = options?.session ?? defaultSessionOptions;
+    if (session && sharedSessionCreated) {
       console.warn(
-        '[react-native-sse-bridge-client] `session` options passed to connect() were ignored: ' +
-          'the shared session/client was already created by an earlier connect() call (on this ' +
-          'or another SSEStream). Session config only takes effect on the very first connect() ' +
-          'made across the whole app — see the "Configuring the shared session" section of the README.',
+        '[react-native-sse-bridge-client] `session` options were ignored: the shared session/client ' +
+          'was already created by an earlier connect() call (on this or another SSEStream). Session ' +
+          'config only takes effect on the very first connect() made across the whole app — call ' +
+          'configureSession() once at startup instead. See the README for details.',
       );
     }
     sharedSessionCreated = true;
     this.connected = true;
     SSEBridgeClientNative.connect(this.id, url, {
       ...options,
+      session,
       eventTypes: Array.from(this.messageListeners.keys()),
     });
   }
