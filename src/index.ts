@@ -52,6 +52,10 @@ export interface SSEStreamOptions {
 type Unsubscribe = () => void;
 
 let nextStreamId = 0;
+// Tracks whether ANY stream has ever called connect() — the shared native session/client is
+// created lazily on that very first call, so this is the JS-side mirror of "does the session
+// already exist" used to warn when a later connect()'s `session` options can't take effect.
+let sharedSessionCreated = false;
 
 // SSE frames with no `event:` field are filed under this key, matching how browser
 // EventSource treats them as type 'message'.
@@ -167,6 +171,15 @@ export class SSEStream {
     if (this.destroyed) {
       throw new Error('SSEStream has been destroyed');
     }
+    if (options?.session && sharedSessionCreated) {
+      console.warn(
+        '[react-native-sse-bridge-client] `session` options passed to connect() were ignored: ' +
+          'the shared session/client was already created by an earlier connect() call (on this ' +
+          'or another SSEStream). Session config only takes effect on the very first connect() ' +
+          'made across the whole app — see the "Configuring the shared session" section of the README.',
+      );
+    }
+    sharedSessionCreated = true;
     this.connected = true;
     SSEBridgeClientNative.connect(this.id, url, {
       ...options,
