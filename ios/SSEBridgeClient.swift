@@ -88,7 +88,15 @@ class SSEBridgeClient: RCTEventEmitter {
 
   @objc(connect:url:options:)
   func connect(_ streamId: String, url: String, options: NSDictionary) {
-    guard let nsUrl = URL(string: url) else { return }
+    // Validated before touching any existing connection, so a bad URL on a reconnect attempt
+    // doesn't tear down a connection that was working fine — and reported through onError like
+    // any other connection failure, rather than left completely silent.
+    guard let nsUrl = URL(string: url) else {
+      if hasListeners {
+        sendEvent(withName: "onError", body: ["streamId": streamId, "message": "Invalid URL: \(url)"])
+      }
+      return
+    }
 
     endTask(for: streamId)
 
@@ -143,13 +151,20 @@ class SSEBridgeClient: RCTEventEmitter {
 
   fileprivate func handleResponse(taskId: Int) {
     guard let streamId = taskIdToStreamId[taskId] else { return }
+    // A superseding connect() may have already replaced this stream's task and started a new
+    // one before this callback for the OLD task's response arrives — without this check, a late
+    // response like this would fire onOpen() for a connection that's no longer the active one.
+    guard streams[streamId]?.task?.taskIdentifier == taskId else { return }
     guard hasListeners else { return }
     sendEvent(withName: "onOpen", body: ["streamId": streamId])
   }
 
   fileprivate func handleData(taskId: Int, data: Data) {
     guard let streamId = taskIdToStreamId[taskId] else { return }
-    guard var state = streams[streamId] else { return }
+    // Same race as handleResponse(): reject bytes from a task that's no longer this stream's
+    // current one, so a superseded connection's late-arriving data can't get appended into the
+    // new connection's (already-reset) byteBuffer.
+    guard var state = streams[streamId], state.task?.taskIdentifier == taskId else { return }
 
     if !state.firstByteLogged, let startedAt = state.connectStartedAt {
       state.firstByteLogged = true
@@ -174,6 +189,9 @@ class SSEBridgeClient: RCTEventEmitter {
 
     guard let error = error as NSError? else { return }
     if error.code == NSURLErrorCancelled { return }
+    // A genuine (non-cancellation) failure on a task a newer connect() has already superseded
+    // shouldn't surface as "the current connection failed" — it isn't, anymore.
+    guard streams[streamId]?.task?.taskIdentifier == taskId else { return }
     NSLog("[Bridge SSE][iOS][%@] error: %@", streamId, error.localizedDescription)
     if hasListeners {
       sendEvent(withName: "onError", body: ["streamId": streamId, "message": error.localizedDescription])

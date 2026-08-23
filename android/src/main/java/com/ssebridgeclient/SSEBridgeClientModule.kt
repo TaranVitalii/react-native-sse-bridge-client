@@ -146,6 +146,23 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
 
   @ReactMethod
   fun connect(streamId: String, url: String, options: ReadableMap?) {
+    // Validated before touching any existing connection, so a bad URL on a reconnect attempt
+    // doesn't tear down a connection that was working fine — and reported through onError like
+    // any other connection failure, rather than left to crash as an uncaught IllegalArgumentException.
+    val requestBuilder = try {
+      Request.Builder().url(url)
+    } catch (e: IllegalArgumentException) {
+      Log.e(LOG_TAG, "[$streamId] invalid URL: $url", e)
+      emitEvent(
+        "onError",
+        Arguments.createMap().apply {
+          putString("streamId", streamId)
+          putString("message", "Invalid URL: $url")
+        }
+      )
+      return
+    }
+
     streams[streamId]?.currentCall?.let { emitCloseMetrics(streamId, it) }
     streams[streamId]?.currentCall?.cancel()
 
@@ -161,8 +178,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     generationCounter += 1
     val generation = generationCounter
 
-    val requestBuilder = Request.Builder()
-      .url(url)
+    requestBuilder
       .header("Accept", "text/event-stream")
       .tag(ConnectionAttempt::class.java, ConnectionAttempt(streamId, generation))
 
@@ -181,6 +197,14 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
 
     call.enqueue(object : Callback {
       override fun onResponse(call: Call, response: Response) {
+        // A superseding connect() may have already cancelled this call and started a new one
+        // before this callback for the OLD call's response arrives — without this check, a late
+        // response like this would fire onOpen()/onMessage() for a connection that's no longer
+        // this stream's active one.
+        if (streams[streamId]?.currentCall !== call) {
+          response.close()
+          return
+        }
         emitEvent("onOpen", Arguments.createMap().apply { putString("streamId", streamId) })
         try {
           val source = response.body?.source()
@@ -191,6 +215,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
           val eventBuffer = StringBuilder()
           var loggedFirstByte = false
           while (!source.exhausted()) {
+            if (streams[streamId]?.currentCall !== call) break
             if (!loggedFirstByte) {
               maybeLogFirstByte(streamId)
               loggedFirstByte = true
@@ -216,6 +241,9 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
       override fun onFailure(call: Call, e: IOException) {
         emitCloseMetrics(streamId, call)
         if (call.isCanceled()) return
+        // A genuine (non-cancellation) failure on a call a newer connect() has already
+        // superseded shouldn't surface as "the current connection failed" — it isn't, anymore.
+        if (streams[streamId]?.currentCall !== call) return
         Log.e(LOG_TAG, "[$streamId] connect failed: ${e.message}", e)
         emitEvent(
           "onError",
