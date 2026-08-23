@@ -201,7 +201,10 @@ export class SSEStream {
     // An explicit `session` on this call wins; otherwise fall back to whatever configureSession()
     // set at app startup, if anything.
     const session = options?.session ?? defaultSessionOptions;
-    if (session && sharedSessionCreated) {
+    // Only warn when THIS call explicitly passed `session` and it's too late for it to apply —
+    // silently falling back to the app-wide default (or to nothing) on a later stream is the
+    // normal, expected case, not a mistake worth flagging.
+    if (options?.session && sharedSessionCreated) {
       console.warn(
         '[react-native-sse-bridge-client] `session` options were ignored: the shared session/client ' +
           'was already created by an earlier connect() call (on this or another SSEStream). Session ' +
