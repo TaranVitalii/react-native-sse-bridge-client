@@ -24,8 +24,29 @@ export interface SSEConnectionMetrics {
   connectionReused?: boolean;
 }
 
+/**
+ * The underlying URLSession (iOS) / OkHttpClient (Android) is shared by every SSEStream and,
+ * once created, kept alive for the app's lifetime — that's what lets a reconnect reuse the
+ * pooled HTTP/2 connection instead of re-handshaking. Because of that, `session` only takes
+ * effect on the very first connect() call made across ALL streams in the app; once that shared
+ * client exists, later streams' `session` options are silently ignored (recreating it would
+ * defeat the whole point — every connection already in the pool would be dropped).
+ */
+export interface SSESessionOptions {
+  /** Request timeout in seconds. Defaults to 3600 on iOS, unlimited (0) on Android. */
+  timeoutSeconds?: number;
+  /**
+   * Max concurrent connections to a single host. Defaults to 6 on iOS. On Android this maps to
+   * OkHttp's `Dispatcher.maxRequestsPerHost` (its closest equivalent — HTTP/2 hosts multiplex
+   * many requests over one connection regardless), defaulting to OkHttp's own default (5).
+   */
+  maxConnectionsPerHost?: number;
+}
+
 export interface SSEStreamOptions {
   headers?: Record<string, string>;
+  /** Only takes effect on the first connect() made across all streams — see SSESessionOptions. */
+  session?: SSESessionOptions;
 }
 
 type Unsubscribe = () => void;

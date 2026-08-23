@@ -72,7 +72,7 @@ Creates a new, independent stream. Classic Native Modules are singletons, so unl
 
 | Method | Description |
 | --- | --- |
-| `connect(url: string, options?: { headers?: Record<string, string> }): void` | Opens a connection to `url`. Calling this again on the same stream cancels the previous connection first (its close metrics still fire). Headers — including `User-Agent` — are entirely JS-configured; nothing is hardcoded natively. |
+| `connect(url: string, options?: SSEStreamOptions): void` | Opens a connection to `url`. Calling this again on the same stream cancels the previous connection first (its close metrics still fire). Headers — including `User-Agent` — are entirely JS-configured; nothing is hardcoded natively. |
 | `disconnect(): void` | Closes the current connection, if any. |
 | `addEventListener(type: string, callback: (event: SSEMessageEvent) => void): () => void` | Subscribes to a specific SSE `event:` type, mirroring the browser `EventSource` model — frames with no `event:` field (or `event: message`) are filed under `'message'`. Returns an unsubscribe function. |
 | `onOpen(callback: () => void): () => void` | Fires when the server responds (response headers received). |
@@ -100,7 +100,34 @@ interface SSEConnectionMetrics {
   tlsMs?: number
   connectionReused?: boolean
 }
+
+interface SSEStreamOptions {
+  headers?: Record<string, string>
+  session?: SSESessionOptions
+}
+
+interface SSESessionOptions {
+  timeoutSeconds?: number
+  maxConnectionsPerHost?: number
+}
 ```
+
+### Configuring the shared session
+
+The underlying `URLSession`/`OkHttpClient` is shared by every `SSEStream` in the app and, once created, kept alive for the app's lifetime — that's the whole mechanism behind connection reuse. Because of that, `options.session` on `connect()` only takes effect on the very **first** `connect()` call made across all streams; once that shared client exists, later streams' `session` options are silently ignored (recreating it on demand would drop every connection already in the pool, defeating the point).
+
+```ts
+stream.connect(url, {
+  session: { timeoutSeconds: 1800, maxConnectionsPerHost: 4 },
+})
+```
+
+If you need this configured deterministically, set it on whichever stream connects first in your app (e.g. one created during startup), or simply be consistent about passing the same `session` values on every `connect()` call so it doesn't matter which one wins the race.
+
+| Option | iOS | Android |
+| --- | --- | --- |
+| `timeoutSeconds` | `URLSessionConfiguration.timeoutIntervalForRequest` (default `3600`) | OkHttp `readTimeout` (default `0`, i.e. unlimited) |
+| `maxConnectionsPerHost` | `URLSessionConfiguration.httpMaximumConnectionsPerHost` (default `6`) | OkHttp `Dispatcher.maxRequestsPerHost` — the closest equivalent; HTTP/2 hosts multiplex many requests over one connection regardless (default `5`, OkHttp's own default) |
 
 ### Reading `onMetrics`
 

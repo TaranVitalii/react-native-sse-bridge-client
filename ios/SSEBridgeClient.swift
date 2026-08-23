@@ -33,7 +33,8 @@ private struct StreamState {
 
 @objc(SSEBridgeClient)
 class SSEBridgeClient: RCTEventEmitter {
-  private let session: URLSession
+  // Lazily created — see sharedSession(options:) below.
+  private var session: URLSession?
   private let streamDelegate = SSEStreamDelegate()
   private static let frameDelimiter = Data([0x0A, 0x0A]) // "\n\n"
 
@@ -42,12 +43,27 @@ class SSEBridgeClient: RCTEventEmitter {
   private var hasListeners = false
 
   override init() {
-    let config = URLSessionConfiguration.default
-    config.timeoutIntervalForRequest = 3600
-    config.httpMaximumConnectionsPerHost = 6
-    self.session = URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
     super.init()
     streamDelegate.client = self
+  }
+
+  // The URLSession is shared by every stream and, once created, kept alive for the app's
+  // lifetime — that's what lets a reconnect reuse the pooled HTTP/2 connection instead of
+  // re-handshaking. Because of that, `options.session` can only take effect on the very first
+  // connect() call across ALL streams; once the session exists, later streams' `session` options
+  // are silently ignored (recreating it would defeat the whole point: every existing connection
+  // in the pool would be dropped).
+  private func sharedSession(options: NSDictionary) -> URLSession {
+    if let session { return session }
+
+    let sessionOptions = options["session"] as? [String: Any]
+    let config = URLSessionConfiguration.default
+    config.timeoutIntervalForRequest = (sessionOptions?["timeoutSeconds"] as? NSNumber)?.doubleValue ?? 3600
+    config.httpMaximumConnectionsPerHost = (sessionOptions?["maxConnectionsPerHost"] as? NSNumber)?.intValue ?? 6
+
+    let newSession = URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
+    session = newSession
+    return newSession
   }
 
   override static func requiresMainQueueSetup() -> Bool {
@@ -88,7 +104,7 @@ class SSEBridgeClient: RCTEventEmitter {
     }
     request.timeoutInterval = 3600
 
-    let task = session.dataTask(with: request)
+    let task = sharedSession(options: options).dataTask(with: request)
     taskIdToStreamId[task.taskIdentifier] = streamId
     streams[streamId]?.task = task
     task.resume()

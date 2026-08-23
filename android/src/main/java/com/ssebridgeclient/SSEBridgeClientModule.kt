@@ -11,6 +11,7 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Connection
+import okhttp3.Dispatcher
 import okhttp3.EventListener
 import okhttp3.Handshake
 import okhttp3.OkHttpClient
@@ -67,46 +68,77 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
   private val timingsByGeneration = mutableMapOf<Int, CallTimings>()
   private var generationCounter = 0
 
-  private val client: OkHttpClient = OkHttpClient.Builder()
-    .readTimeout(0, TimeUnit.MILLISECONDS)
-    .eventListenerFactory { call ->
-      val attempt = call.request().tag(ConnectionAttempt::class.java)
-      val timings = CallTimings()
-      if (attempt != null) timingsByGeneration[attempt.generation] = timings
+  // Lazily created — see sharedClient(options:) below.
+  private var client: OkHttpClient? = null
 
-      object : EventListener() {
-        override fun callStart(call: Call) {
-          timings.callStart = System.nanoTime()
-        }
+  // Shared by every stream and, once created, kept alive for the app's lifetime — that's what
+  // lets a reconnect reuse the pooled HTTP/2 connection instead of re-handshaking. Because of
+  // that, `options.session` can only take effect on the very first connect() call across ALL
+  // streams; once the client exists, later streams' `session` options are silently ignored
+  // (recreating it would defeat the whole point: every existing pooled connection would drop).
+  private fun sharedClient(options: ReadableMap?): OkHttpClient {
+    client?.let { return it }
 
-        override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
-          timings.connectStart = System.nanoTime()
-        }
+    val sessionOptions = options?.getMap("session")
+    val readTimeoutSeconds = if (sessionOptions?.hasKey("timeoutSeconds") == true) {
+      sessionOptions.getDouble("timeoutSeconds")
+    } else {
+      0.0 // matches the previous hardcoded default: no timeout
+    }
+    // OkHttp has no direct equivalent of iOS's httpMaximumConnectionsPerHost; maxRequestsPerHost
+    // is the closest analogue (concurrent requests to a single host), defaulting to OkHttp's own
+    // built-in default when not specified.
+    val maxRequestsPerHost = if (sessionOptions?.hasKey("maxConnectionsPerHost") == true) {
+      sessionOptions.getInt("maxConnectionsPerHost")
+    } else {
+      Dispatcher().maxRequestsPerHost
+    }
 
-        override fun secureConnectStart(call: Call) {
-          timings.secureConnectStart = System.nanoTime()
-        }
+    val newClient = OkHttpClient.Builder()
+      .readTimeout(readTimeoutSeconds.toLong(), TimeUnit.SECONDS)
+      .dispatcher(Dispatcher().apply { this.maxRequestsPerHost = maxRequestsPerHost })
+      .eventListenerFactory { call ->
+        val attempt = call.request().tag(ConnectionAttempt::class.java)
+        val timings = CallTimings()
+        if (attempt != null) timingsByGeneration[attempt.generation] = timings
 
-        override fun secureConnectEnd(call: Call, handshake: Handshake?) {
-          timings.secureConnectEnd = System.nanoTime()
-        }
+        object : EventListener() {
+          override fun callStart(call: Call) {
+            timings.callStart = System.nanoTime()
+          }
 
-        override fun connectEnd(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?) {
-          timings.connectEnd = System.nanoTime()
-        }
+          override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
+            timings.connectStart = System.nanoTime()
+          }
 
-        override fun connectionAcquired(call: Call, connection: Connection) {
-          // If connectStart never fired for this call, OkHttp handed us an already-pooled
-          // connection instead of opening a new one — that absence is the reuse signal.
-          timings.connectionReused = timings.connectStart == null
-        }
+          override fun secureConnectStart(call: Call) {
+            timings.secureConnectStart = System.nanoTime()
+          }
 
-        override fun responseHeadersStart(call: Call) {
-          timings.responseHeadersStart = System.nanoTime()
+          override fun secureConnectEnd(call: Call, handshake: Handshake?) {
+            timings.secureConnectEnd = System.nanoTime()
+          }
+
+          override fun connectEnd(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?) {
+            timings.connectEnd = System.nanoTime()
+          }
+
+          override fun connectionAcquired(call: Call, connection: Connection) {
+            // If connectStart never fired for this call, OkHttp handed us an already-pooled
+            // connection instead of opening a new one — that absence is the reuse signal.
+            timings.connectionReused = timings.connectStart == null
+          }
+
+          override fun responseHeadersStart(call: Call) {
+            timings.responseHeadersStart = System.nanoTime()
+          }
         }
       }
-    }
-    .build()
+      .build()
+
+    client = newClient
+    return newClient
+  }
 
   @ReactMethod
   fun connect(streamId: String, url: String, options: ReadableMap?) {
@@ -139,7 +171,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
       }
     }
 
-    val call = client.newCall(requestBuilder.build())
+    val call = sharedClient(options).newCall(requestBuilder.build())
     state.currentCall = call
 
     call.enqueue(object : Callback {
