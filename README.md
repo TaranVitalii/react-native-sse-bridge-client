@@ -9,7 +9,7 @@ A native Server-Sent Events (SSE) client for React Native's classic bridge — f
 
 Most React Native SSE clients (including the popular `react-native-sse`) are built on top of `XMLHttpRequest`. Every reconnect opens a brand new HTTP request from scratch, which means a full TCP + TLS handshake every time — typically 300–600ms of latency the user sees on every reconnect, even to a server they were just talking to a second ago.
 
-This library talks to the platform's native HTTP stack directly — `URLSession` on iOS, `OkHttp` on Android — which both keep a warm connection pool. As long as the same underlying client is reused across `connect()` calls (which it is, internally), a reconnect to the same host reuses the existing HTTP/2 connection instead of re-handshaking. `onMetrics` reports real, measured proof of this on every connection: whether it was a fresh handshake or a reused connection, and how long each phase took.
+This library talks to the platform's native HTTP stack directly — `URLSession` on iOS, `OkHttp` on Android — which both keep a warm connection pool. As long as the same underlying client is reused across `connect()` calls (which it is, internally), a reconnect to the same host reuses the existing HTTP/2 connection instead of re-handshaking. `onMetrics` reports real, measured proof of this on every connection: whether it was a fresh handshake or a reused one.
 
 It's built on the classic Native Modules bridge (`RCTEventEmitter` on iOS, a plain `ReactContextBaseJavaModule` on Android) rather than Nitro/JSI — for the same connection-reuse proof on apps that can't run Nitro Modules. If your app can use the New Architecture, see [`react-native-nitro-sse-client`](https://github.com/TaranVitalii/react-native-nitro-sse-client) instead — same idea, JSI-direct, no bridge.
 
@@ -40,17 +40,8 @@ stream.addEventListener('message', event => {
 
 stream.onError(message => console.log('error:', message))
 
-stream.onMetrics(metrics => {
-  if (metrics.phase === 'ttfb') {
-    console.log(`time to first byte: ${metrics.ttfbMs}ms`)
-  } else {
-    // fires when the connection closes (disconnect(), or a superseding connect())
-    console.log(
-      `closed — reused=${metrics.connectionReused} ` +
-        `connect=${metrics.connectMs}ms tls=${metrics.tlsMs}ms ttfb=${metrics.ttfbMs}ms`
-    )
-  }
-})
+// fires once, when the connection closes (disconnect(), a superseding connect(), or a failure)
+stream.onMetrics(metrics => console.log('connection reused:', metrics.connectionReused))
 
 stream.connect('https://your-server.example.com/events', {
   headers: { Authorization: 'Bearer …' },
@@ -81,7 +72,7 @@ Sets the shared session config (timeout, max connections per host) once, up fron
 | `addEventListener(type: string, callback: (event: SSEMessageEvent) => void): () => void` | Subscribes to a specific SSE `event:` type, mirroring the browser `EventSource` model — frames with no `event:` field (or `event: message`) are filed under `'message'`. Returns an unsubscribe function. |
 | `onOpen(callback: () => void): () => void` | Fires when the server responds (response headers received). |
 | `onError(callback: (message: string) => void): () => void` | Fires on a network/transport failure. Not called for a `disconnect()` you initiated yourself. |
-| `onMetrics(callback: (metrics: SSEConnectionMetrics) => void): () => void` | Fires twice per connection — see below. |
+| `onMetrics(callback: (metrics: SSEConnectionMetrics) => void): () => void` | Fires once per connection, when it ends — see below. Like `addEventListener`, whether this has any listener is pushed down natively; with none, the event is dropped before it crosses the bridge. |
 | `destroy(): void` | Disconnects, drops every listener, and unsubscribes from the shared native event emitter. Call this when you're done with the stream (e.g. on unmount). |
 
 ### Event-type filtering happens natively
@@ -98,11 +89,7 @@ interface SSEMessageEvent {
 }
 
 interface SSEConnectionMetrics {
-  phase: 'ttfb' | 'closed'
-  ttfbMs?: number
-  connectMs?: number
-  tlsMs?: number
-  connectionReused?: boolean
+  connectionReused: boolean
 }
 
 interface SSEStreamOptions {
@@ -150,12 +137,11 @@ stream.connect(url, {
 
 ### Reading `onMetrics`
 
-Each connection reports metrics twice:
+Fires once per connection, when it ends (you called `disconnect()`, a new `connect()` superseded it, or it failed) — `connectionReused` is only knowable at that point, not any earlier. On iOS it comes from `URLSessionTaskMetrics`, which the OS only hands over once the task has fully finished; there's no way to report this alongside `onOpen` on either platform.
 
-1. **`phase: 'ttfb'`** — fires the moment the first byte of the body arrives. Only `ttfbMs` is populated; use this for a real-time "how long did that take" readout.
-2. **`phase: 'closed'`** — fires once the connection ends (you called `disconnect()`, or a new `connect()` superseded it). This carries the authoritative breakdown: `connectMs`, `tlsMs`, and `connectionReused`.
+`connectionReused: true` means the OS handed this connection an already-open TCP/TLS session from the pool instead of doing a fresh handshake — the thing this whole library exists to make happen. `false` on every reconnect to the same host would mean something's wrong (a new `URLSession`/`OkHttpClient` being created somewhere, a host header mismatch, etc.).
 
-`connectMs`/`tlsMs` come back `undefined` — not `0` — when `connectionReused` is `true`. That's not missing data: it means the OS handed the request an already-open connection, so those phases genuinely didn't happen. A `0`-vs-`undefined` distinction here is the actual signal, which is why the fields are optional rather than defaulting to zero.
+A full per-phase timing breakdown (DNS/connect/TLS/TTFB) is still logged natively (`NSLog` on iOS, `Log.d` on Android, tag `BridgeSSE`) for whoever's debugging the library itself — it's just not sent across the bridge, since a granular breakdown isn't something most consumers of the library need.
 
 ## How reconnects work
 

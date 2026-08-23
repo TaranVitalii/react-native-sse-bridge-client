@@ -8,20 +8,20 @@ if (!SSEBridgeClientNative) {
   );
 }
 
-export type SSEMetricsPhase = 'ttfb' | 'closed';
-
 export interface SSEMessageEvent {
   id?: string;
   event: string;
   data: string;
 }
 
+/**
+ * Fires once, when a connection ends (you called disconnect(), a new connect() superseded it,
+ * or it failed) — `connectionReused` is only knowable at that point: on iOS it comes from
+ * URLSessionTaskMetrics, which the OS only hands over once the task has fully finished, so
+ * there's no way to report this any earlier (e.g. alongside onOpen) on either platform.
+ */
 export interface SSEConnectionMetrics {
-  phase: SSEMetricsPhase;
-  ttfbMs?: number;
-  connectMs?: number;
-  tlsMs?: number;
-  connectionReused?: boolean;
+  connectionReused: boolean;
 }
 
 /**
@@ -182,10 +182,6 @@ export class SSEStream {
             return;
           }
           const metrics: SSEConnectionMetrics = {
-            phase: body.phase,
-            ttfbMs: body.ttfbMs,
-            connectMs: body.connectMs,
-            tlsMs: body.tlsMs,
             connectionReused: body.connectionReused,
           };
           this.metricsListeners.forEach((cb) => cb(metrics));
@@ -218,6 +214,7 @@ export class SSEStream {
       ...options,
       session,
       eventTypes: Array.from(this.messageListeners.keys()),
+      metricsEnabled: this.metricsListeners.size > 0,
     });
   }
 
@@ -275,9 +272,29 @@ export class SSEStream {
     return () => this.errorListeners.delete(callback);
   }
 
+  // Like addEventListener()'s type filter, whether ANY onMetrics() listener exists is pushed
+  // down to the native module — with zero listeners, the connectionReused event is dropped
+  // natively before it ever crosses the bridge (it only fires once per connection anyway, so
+  // this matters far less than message filtering, but it's free to do the same way).
   onMetrics(callback: (metrics: SSEConnectionMetrics) => void): Unsubscribe {
     this.metricsListeners.add(callback);
-    return () => this.metricsListeners.delete(callback);
+    this.pushMetricsEnabled();
+    return () => {
+      this.metricsListeners.delete(callback);
+      this.pushMetricsEnabled();
+    };
+  }
+
+  // Only meaningful once connected — before that, connect() reads metricsListeners' current
+  // size itself.
+  private pushMetricsEnabled(): void {
+    if (!this.connected) {
+      return;
+    }
+    SSEBridgeClientNative.setMetricsEnabled(
+      this.id,
+      this.metricsListeners.size > 0,
+    );
   }
 
   /** Disconnects, drops all listeners, and unsubscribes from the shared native emitter. */

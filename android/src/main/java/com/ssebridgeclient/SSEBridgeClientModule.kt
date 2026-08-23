@@ -62,6 +62,10 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     // emitted — everything else (e.g. `event: ping` heartbeats) is dropped before it ever
     // reaches the bridge, so a chatty/unwanted event type never costs a JS-thread call.
     var eventFilter: Set<String> = emptySet()
+    // false = no onMetrics() listener on the JS side for this stream, so the connectionReused
+    // event is dropped before it crosses the bridge — same idea as eventFilter, just a single
+    // flag since there's only one metrics event (fired once, on close) rather than a set of types.
+    var metricsEnabled = false
   }
 
   private val streams = mutableMapOf<String, StreamState>()
@@ -151,6 +155,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     if (eventTypes != null && eventTypes.size() > 0) {
       state.eventFilter = (0 until eventTypes.size()).mapNotNull { eventTypes.getString(it) }.toSet()
     }
+    state.metricsEnabled = options?.hasKey("metricsEnabled") == true && options.getBoolean("metricsEnabled")
     streams[streamId] = state
 
     generationCounter += 1
@@ -237,6 +242,11 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     state.eventFilter = (0 until types.size()).mapNotNull { types.getString(it) }.toSet()
   }
 
+  @ReactMethod
+  fun setMetricsEnabled(streamId: String, enabled: Boolean) {
+    streams[streamId]?.metricsEnabled = enabled
+  }
+
   // Required no-ops: NativeEventEmitter on the JS side calls these to (un)register interest;
   // our events fire regardless, but RN warns if a module used with NativeEventEmitter is
   // missing them.
@@ -246,6 +256,8 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
   @ReactMethod
   fun removeListeners(count: Int) {}
 
+  // Native-only diagnostic — not sent to JS. onMetrics is limited to connectionReused (see
+  // SSEConnectionMetrics on the JS side), which isn't knowable until the connection closes.
   private fun maybeLogFirstByte(streamId: String) {
     val state = streams[streamId] ?: return
     if (state.firstByteLogged) return
@@ -253,15 +265,6 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     val startedAt = state.connectStartedAt ?: return
     val ttfbMs = (System.nanoTime() - startedAt) / 1_000_000.0
     Log.d(LOG_TAG, "[$streamId] time to first data: ${"%.1f".format(ttfbMs)}ms")
-
-    emitEvent(
-      "onMetrics",
-      Arguments.createMap().apply {
-        putString("streamId", streamId)
-        putString("phase", "ttfb")
-        putDouble("ttfbMs", ttfbMs)
-      }
-    )
   }
 
   private fun parseAndEmit(streamId: String, rawEvent: String) {
@@ -308,20 +311,19 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     val tlsMs = durationMs(timings.secureConnectStart, timings.secureConnectEnd)
     val ttfbMs = durationMs(timings.callStart, timings.responseHeadersStart)
 
+    // Full breakdown stays native-only (log line) — only connectionReused crosses the bridge,
+    // and only if this stream has an onMetrics() listener registered.
     Log.d(
       LOG_TAG,
       "[$streamId] connection closed reused=${timings.connectionReused} connect=${connectMs}ms tls=${tlsMs}ms ttfb=${ttfbMs}ms"
     )
 
+    if (streams[streamId]?.metricsEnabled != true) return
     emitEvent(
       "onMetrics",
       Arguments.createMap().apply {
         putString("streamId", streamId)
-        putString("phase", "closed")
         putBoolean("connectionReused", timings.connectionReused)
-        if (connectMs != null) putDouble("connectMs", connectMs)
-        if (tlsMs != null) putDouble("tlsMs", tlsMs)
-        if (ttfbMs != null) putDouble("ttfbMs", ttfbMs)
       }
     )
   }

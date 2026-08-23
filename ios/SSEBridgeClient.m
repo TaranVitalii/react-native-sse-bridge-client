@@ -13,5 +13,6 @@
 RCT_EXTERN_METHOD(connect:(NSString *)streamId url:(NSString *)url options:(NSDictionary *)options)
 RCT_EXTERN_METHOD(disconnect:(NSString *)streamId)
 RCT_EXTERN_METHOD(setEventFilter:(NSString *)streamId types:(NSArray *)types)
+RCT_EXTERN_METHOD(setMetricsEnabled:(NSString *)streamId enabled:(BOOL)enabled)
 
 @end

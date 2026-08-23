@@ -29,6 +29,10 @@ private struct StreamState {
   // everything else (e.g. `event: ping` heartbeats) is dropped before it ever reaches the
   // bridge, so a chatty/unwanted event type never costs a JS-thread call.
   var eventFilter: Set<String> = []
+  // false = no onMetrics() listener on the JS side for this stream, so the connectionReused
+  // event is dropped before it crosses the bridge — same idea as eventFilter, just a single flag
+  // since there's only one metrics event (fired once, on close) rather than a set of types.
+  var metricsEnabled = false
 }
 
 @objc(SSEBridgeClient)
@@ -93,6 +97,7 @@ class SSEBridgeClient: RCTEventEmitter {
     if let eventTypes = options["eventTypes"] as? [String], !eventTypes.isEmpty {
       state.eventFilter = Set(eventTypes)
     }
+    state.metricsEnabled = (options["metricsEnabled"] as? NSNumber)?.boolValue ?? false
     streams[streamId] = state
 
     var request = URLRequest(url: nsUrl)
@@ -121,6 +126,11 @@ class SSEBridgeClient: RCTEventEmitter {
     streams[streamId]?.eventFilter = Set(types)
   }
 
+  @objc(setMetricsEnabled:enabled:)
+  func setMetricsEnabled(_ streamId: String, enabled: Bool) {
+    streams[streamId]?.metricsEnabled = enabled
+  }
+
   private func endTask(for streamId: String) {
     guard let task = streams[streamId]?.task else { return }
     task.cancel()
@@ -138,15 +148,10 @@ class SSEBridgeClient: RCTEventEmitter {
 
     if !state.firstByteLogged, let startedAt = state.connectStartedAt {
       state.firstByteLogged = true
+      // Native-only diagnostic — not sent to JS. onMetrics is limited to connectionReused (see
+      // SSEConnectionMetrics), which isn't knowable until the connection closes.
       let ttfbMs = Date().timeIntervalSince(startedAt) * 1000
       NSLog("[Bridge SSE][iOS][%@] time to first data: %.1fms", streamId, ttfbMs)
-      if hasListeners {
-        sendEvent(withName: "onMetrics", body: [
-          "streamId": streamId,
-          "phase": "ttfb",
-          "ttfbMs": ttfbMs,
-        ])
-      }
     }
 
     // Drop bare CR bytes so "\r\n" collapses to "\n" (SSE line endings), without the cost of
@@ -187,22 +192,15 @@ class SSEBridgeClient: RCTEventEmitter {
     let tlsMs = durationMs(txn.secureConnectionStartDate, txn.secureConnectionEndDate)
     let ttfbMs = durationMs(txn.fetchStartDate, txn.responseStartDate)
 
+    // Full breakdown stays native-only (log line) — only connectionReused crosses the bridge,
+    // and only if this stream has an onMetrics() listener registered.
     NSLog(
       "[Bridge SSE][iOS][%@] connection closed reused=%@ connect=%.1fms tls=%.1fms ttfb=%.1fms",
       streamId, reused ? "true" : "false", connectMs ?? 0, tlsMs ?? 0, ttfbMs ?? 0
     )
 
-    if hasListeners {
-      var body: [String: Any] = [
-        "streamId": streamId,
-        "phase": "closed",
-        "connectionReused": reused,
-      ]
-      if let connectMs { body["connectMs"] = connectMs }
-      if let tlsMs { body["tlsMs"] = tlsMs }
-      if let ttfbMs { body["ttfbMs"] = ttfbMs }
-      sendEvent(withName: "onMetrics", body: body)
-    }
+    guard hasListeners, streams[streamId]?.metricsEnabled == true else { return }
+    sendEvent(withName: "onMetrics", body: ["streamId": streamId, "connectionReused": reused])
   }
 
   private func drainBuffer(streamId: String) {
