@@ -1,0 +1,119 @@
+{
+  "name": "react-native-sse-bridge-client",
+  "version": "0.1.0",
+  "description": "Native Server-Sent Events (SSE) client for React Native's classic bridge — reuses the platform's HTTP/2 connection pool across reconnects (URLSession on iOS, OkHttp on Android) for apps that can't use the New Architecture / Nitro Modules.",
+  "main": "./lib/commonjs/index.js",
+  "module": "./lib/module/index.js",
+  "types": "./lib/typescript/src/index.d.ts",
+  "react-native": "src/index",
+  "source": "src/index",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "clean": "git clean -dfX",
+    "release": "semantic-release",
+    "build": "npm run typecheck && bob build"
+  },
+  "keywords": [
+    "react-native",
+    "sse",
+    "server-sent-events",
+    "eventsource",
+    "http2",
+    "okhttp",
+    "urlsession",
+    "classic-bridge"
+  ],
+  "files": [
+    "src",
+    "lib",
+    "android/build.gradle",
+    "android/src",
+    "ios/**/*.h",
+    "ios/**/*.m",
+    "ios/**/*.swift",
+    "*.podspec",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": "https://github.com/TaranVitalii/react-native-sse-bridge-client.git",
+  "author": "Vitalii Taran",
+  "license": "MIT",
+  "bugs": "https://github.com/TaranVitalii/react-native-sse-bridge-client/issues",
+  "homepage": "https://github.com/TaranVitalii/react-native-sse-bridge-client#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">= 22.11.0"
+  },
+  "devDependencies": {
+    "@jamesacarr/eslint-formatter-github-actions": "^0.2.0",
+    "@react-native/eslint-config": "0.87.0",
+    "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/git": "^10.0.1",
+    "conventional-changelog-conventionalcommits": "^10.2.1",
+    "eslint": "^8.19.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-prettier": "^4.2.1",
+    "prettier": "2.8.8",
+    "react": "19.2.3",
+    "react-native": "0.87.0",
+    "react-native-builder-bob": "^0.40.18",
+    "semantic-release": "^25.0.7",
+    "typescript": "^6.0.3"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*"
+  },
+  "eslintConfig": {
+    "root": true,
+    "extends": [
+      "@react-native",
+      "prettier"
+    ],
+    "plugins": [
+      "prettier"
+    ],
+    "rules": {
+      "prettier/prettier": [
+        "warn",
+        {
+          "quoteProps": "consistent",
+          "singleQuote": true,
+          "tabWidth": 2,
+          "trailingComma": "all",
+          "useTabs": false
+        }
+      ]
+    }
+  },
+  "eslintIgnore": [
+    "node_modules/",
+    "lib/"
+  ],
+  "prettier": {
+    "quoteProps": "consistent",
+    "singleQuote": true,
+    "tabWidth": 2,
+    "trailingComma": "all",
+    "useTabs": false,
+    "semi": true
+  },
+  "react-native-builder-bob": {
+    "source": "src",
+    "output": "lib",
+    "targets": [
+      "commonjs",
+      "module",
+      [
+        "typescript",
+        {
+          "project": "tsconfig.json"
+        }
+      ]
+    ]
+  }
+}

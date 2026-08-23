@@ -1,0 +1,41 @@
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+
+def getExtOrDefault(name) {
+  return rootProject.ext.has(name) ? rootProject.ext.get(name) : project.properties["SSEBridgeClient_" + name]
+}
+
+android {
+  namespace "com.ssebridgeclient"
+
+  compileSdkVersion getExtOrDefault("compileSdkVersion").toInteger()
+
+  defaultConfig {
+    minSdkVersion getExtOrDefault("minSdkVersion").toInteger()
+    targetSdkVersion getExtOrDefault("targetSdkVersion").toInteger()
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+
+  kotlinOptions {
+    jvmTarget = "17"
+  }
+}
+
+repositories {
+  mavenCentral()
+  google()
+}
+
+dependencies {
+  implementation "com.facebook.react:react-android"
+
+  // OkHttp 5.x requires compileSdk 37+, which apps on the classic bridge (this library's target
+  // audience — older RN versions, or New Architecture explicitly disabled) often aren't on yet.
+  // Pinning to the last 4.x release keeps this library compatible with them; HTTP/2 connection
+  // pooling — the whole point of this library — works identically in both major versions.
+  implementation "com.squareup.okhttp3:okhttp:4.12.0"
+}
