@@ -107,9 +107,14 @@ class SSEBridgeClient: RCTEventEmitter {
         request.setValue(value, forHTTPHeaderField: key)
       }
     }
-    request.timeoutInterval = 3600
+    let session = sharedSession(options: options)
+    // URLSessionConfiguration.timeoutIntervalForRequest is unreliable once a request carries its
+    // own timeoutInterval (which URLRequest always does, defaulting to 60s) — the request-level
+    // value wins. Reading it back off the session's own configuration, rather than hardcoding a
+    // separate constant here, keeps this in sync with whatever options.session set.
+    request.timeoutInterval = session.configuration.timeoutIntervalForRequest
 
-    let task = sharedSession(options: options).dataTask(with: request)
+    let task = session.dataTask(with: request)
     taskIdToStreamId[task.taskIdentifier] = streamId
     streams[streamId]?.task = task
     task.resume()
