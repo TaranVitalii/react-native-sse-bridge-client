@@ -52,7 +52,7 @@
     "@jamesacarr/eslint-formatter-github-actions": "^0.2.0",
     "@react-native/babel-preset": "0.87.0",
     "@react-native/eslint-config": "0.87.0",
-    "conventional-changelog-conventionalcommits": "^10.2.1",
+    "conventional-changelog-conventionalcommits": "^9.3.1",
     "eslint": "^8.19.0",
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-prettier": "^4.2.1",
