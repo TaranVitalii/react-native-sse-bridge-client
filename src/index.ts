@@ -15,6 +15,24 @@ export interface SSEMessageEvent {
 }
 
 /**
+ * 'http': the server responded, but with a non-2xx status — `statusCode` and `message` (the
+ * response body, if any) are populated.
+ * 'timeout': the request's own timeout (SSESessionOptions.timeoutSeconds) elapsed with no
+ * response.
+ * 'network': a transport-level failure (DNS, connection refused, TLS, dropped connection, etc.)
+ * — `message` is the OS's own error description.
+ * 'exception': the call couldn't even be attempted (e.g. an invalid URL).
+ */
+export type SSEErrorType = 'http' | 'network' | 'timeout' | 'exception';
+
+export interface SSEError {
+  message: string;
+  type: SSEErrorType;
+  /** Only set when type is 'http'. */
+  statusCode?: number;
+}
+
+/**
  * Fires once, when a connection ends (you called disconnect(), a new connect() superseded it,
  * or it failed) — `connectionReused` is only knowable at that point: on iOS it comes from
  * URLSessionTaskMetrics, which the OS only hands over once the task has fully finished, so
@@ -22,6 +40,28 @@ export interface SSEMessageEvent {
  */
 export interface SSEConnectionMetrics {
   connectionReused: boolean;
+}
+
+/**
+ * Governs automatic reconnection after a connection ends for any reason (error, or the server
+ * closing the stream) other than an explicit disconnect(). Mirrors the browser EventSource /
+ * react-native-sse model: reconnect is on by default, at a flat interval the server can override
+ * per-stream via an SSE `retry:` field (no exponential backoff).
+ */
+export interface SSEReconnectOptions {
+  /** Default true. */
+  enabled?: boolean;
+  /**
+   * Delay before the first/next reconnect attempt, in ms. Default 3000. A `retry:` field in the
+   * stream overrides this for that stream's subsequent reconnects (until connect() is called
+   * again explicitly, which resets it back to this value).
+   */
+  intervalMs?: number;
+  /**
+   * Stop reconnecting after this many consecutive failed attempts. Default undefined (retry
+   * forever). Resets to 0 after any successful onOpen.
+   */
+  maxAttempts?: number;
 }
 
 /**
@@ -49,6 +89,9 @@ export interface SSEStreamOptions {
   headers?: Record<string, string>;
   /** Only takes effect on the first connect() made across all streams — see SSESessionOptions. */
   session?: SSESessionOptions;
+  /** Automatic reconnect after the connection ends (error, or the server closing the stream).
+   * On by default — see SSEReconnectOptions. */
+  reconnect?: SSEReconnectOptions;
 }
 
 type Unsubscribe = () => void;
@@ -98,19 +141,26 @@ interface NativeMessagePayload {
   data: string;
 }
 
+interface NativeErrorPayload {
+  message: string;
+  type: SSEErrorType;
+  statusCode?: number;
+}
+
 // Declared explicitly (rather than left to NativeEventEmitter's default generic) so
 // addListener()'s callback parameter is typed as our actual payload shape instead of the
 // permissive default `Object`.
 type SSEBridgeEventArgs =
   | [NativeStreamPayload]
   | [NativeStreamPayload & NativeMessagePayload]
-  | [NativeStreamPayload & { message: string }]
+  | [NativeStreamPayload & NativeErrorPayload]
   | [NativeStreamPayload & SSEConnectionMetrics];
 
 interface SSEBridgeEventMap {
   onOpen: [NativeStreamPayload];
   onMessage: [NativeStreamPayload & NativeMessagePayload];
-  onError: [NativeStreamPayload & { message: string }];
+  onError: [NativeStreamPayload & NativeErrorPayload];
+  onClose: [NativeStreamPayload];
   onMetrics: [NativeStreamPayload & SSEConnectionMetrics];
   [key: string]: SSEBridgeEventArgs;
 }
@@ -135,6 +185,10 @@ const emitter = new NativeEventEmitter<SSEBridgeEventMap>(
  * is pushed down to the native module (at connect() time, and live via setEventFilter() for any
  * addEventListener()/unsubscribe() call after that), so an event type nobody subscribed to is
  * dropped before it ever crosses the bridge — it never costs a JS-thread call.
+ *
+ * Reconnects automatically after the connection ends for any reason other than disconnect()
+ * (mirrors browser EventSource / react-native-sse) — disable via `connect(url, { reconnect: {
+ * enabled: false } })` if you'd rather handle that yourself.
  */
 export class SSEStream {
   private readonly id = `sse-${nextStreamId++}`;
@@ -143,7 +197,8 @@ export class SSEStream {
     Set<(event: SSEMessageEvent) => void>
   >();
   private openListeners = new Set<() => void>();
-  private errorListeners = new Set<(message: string) => void>();
+  private errorListeners = new Set<(error: SSEError) => void>();
+  private closeListeners = new Set<() => void>();
   private metricsListeners = new Set<(metrics: SSEConnectionMetrics) => void>();
   private nativeSubs: { remove: () => void }[];
   private destroyed = false;
@@ -168,13 +223,24 @@ export class SSEStream {
       ),
       emitter.addListener(
         'onError',
-        (body: NativeStreamPayload & { message: string }) => {
+        (body: NativeStreamPayload & NativeErrorPayload) => {
           if (body.streamId !== this.id) {
             return;
           }
-          this.errorListeners.forEach((cb) => cb(body.message));
+          const error: SSEError = {
+            message: body.message,
+            type: body.type,
+            statusCode: body.statusCode,
+          };
+          this.errorListeners.forEach((cb) => cb(error));
         },
       ),
+      emitter.addListener('onClose', (body: NativeStreamPayload) => {
+        if (body.streamId !== this.id) {
+          return;
+        }
+        this.closeListeners.forEach((cb) => cb());
+      }),
       emitter.addListener(
         'onMetrics',
         (body: NativeStreamPayload & SSEConnectionMetrics) => {
@@ -267,9 +333,17 @@ export class SSEStream {
     return () => this.openListeners.delete(callback);
   }
 
-  onError(callback: (message: string) => void): Unsubscribe {
+  onError(callback: (error: SSEError) => void): Unsubscribe {
     this.errorListeners.add(callback);
     return () => this.errorListeners.delete(callback);
+  }
+
+  /** Fires whenever the connection ends, for any reason — a normal server-side close, right
+   * after onError, or an explicit disconnect(). Fires again after every automatic reconnect's
+   * connection ends, so it does not mean the stream gave up. */
+  onClose(callback: () => void): Unsubscribe {
+    this.closeListeners.add(callback);
+    return () => this.closeListeners.delete(callback);
   }
 
   // Like addEventListener()'s type filter, whether ANY onMetrics() listener exists is pushed
@@ -306,6 +380,7 @@ export class SSEStream {
     this.messageListeners.clear();
     this.openListeners.clear();
     this.errorListeners.clear();
+    this.closeListeners.clear();
     this.metricsListeners.clear();
   }
 }
