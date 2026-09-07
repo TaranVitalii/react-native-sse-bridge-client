@@ -12,6 +12,8 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableMap
+import com.facebook.react.bridge.WritableArray
+import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import okhttp3.Call
 import okhttp3.Callback
@@ -25,6 +27,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okio.Buffer
+import org.json.JSONArray
+import org.json.JSONObject
+import org.json.JSONTokener
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Proxy
@@ -170,6 +175,16 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     // callback that happens to fire while already offline doesn't immediately pause a connect()
     // that hasn't even been attempted yet.
     var hasNetworkConnectivity: Boolean? = null
+
+    // Heartbeat watchdog (SSEReconnectOptions.heartbeatTimeoutMs). A self-resetting "dead man's
+    // switch": every complete line read (including a bare `:` heartbeat comment, which never
+    // reaches parseAndEmit as a message) reschedules this via resetHeartbeatWatchdog() — if it
+    // ever actually fires, no data of any kind arrived within the window, so the connection is
+    // presumed dead.
+    var heartbeatTimeoutMs: Double? = null
+    var heartbeatWatchdog: Runnable? = null
+
+    var autoParseJSON = false
   }
 
   private val streams = mutableMapOf<String, StreamState>()
@@ -276,6 +291,11 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     // awaitingBeforeRequestId, since nextBeforeRequestId never resets), but cancelling it is
     // still tidier than leaving a dead Runnable sitting in the Handler's queue.
     streams[streamId]?.pendingBeforeRequestTimeout?.let { mainHandler.removeCallbacks(it) }
+    // Without this, a stale watchdog from the OLD StreamState (about to be discarded below) could
+    // still fire after the new StreamState/call are in place — handleHeartbeatTimeout() looks up
+    // streams[streamId] fresh, so it would incorrectly kill the brand new connection instead of
+    // silently no-oping against an already-gone state.
+    streams[streamId]?.heartbeatWatchdog?.let { mainHandler.removeCallbacks(it) }
     stopNetworkMonitoring(streamId)
     streams[streamId]?.currentCall?.let { emitCloseMetrics(streamId, it) }
     streams[streamId]?.currentCall?.cancel()
@@ -318,6 +338,12 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     } else {
       true
     }
+    state.heartbeatTimeoutMs = if (reconnectOptions?.hasKey("heartbeatTimeoutMs") == true) {
+      reconnectOptions.getDouble("heartbeatTimeoutMs")
+    } else {
+      null
+    }
+    state.autoParseJSON = options?.hasKey("autoParseJSON") == true && options.getBoolean("autoParseJSON")
 
     streams[streamId] = state
     // `options` (session config) is only ever consulted on the very first connect() made across
@@ -394,6 +420,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     state.pendingBeforeRequestTimeout?.let { mainHandler.removeCallbacks(it) }
     state.pendingBeforeRequestTimeout = null
     state.awaitingBeforeRequestId = null
+    stopHeartbeatWatchdog(streamId)
     state.currentCall?.let { emitCloseMetrics(streamId, it) }
     val hadActiveCall = state.currentCall != null
     state.currentCall?.cancel()
@@ -411,6 +438,51 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     if (!state.monitorNetworkEnabled || state.currentState != ConnectionState.PAUSED) return
     state.reconnectAttempts = 0
     performConnect(streamId, isReconnect = true)
+  }
+
+  // Cancels any pending watchdog and, if heartbeatTimeoutMs is set, schedules a fresh one — call
+  // this on every sign of life (the first onOpen, and every subsequent complete line read) to
+  // keep pushing the deadline out. Left disabled (no-op beyond the cancel) when
+  // heartbeatTimeoutMs is null, which is the default.
+  private fun resetHeartbeatWatchdog(streamId: String) {
+    val state = streams[streamId] ?: return
+    state.heartbeatWatchdog?.let { mainHandler.removeCallbacks(it) }
+    state.heartbeatWatchdog = null
+    val timeoutMs = state.heartbeatTimeoutMs ?: return
+    val watchdog = Runnable { handleHeartbeatTimeout(streamId) }
+    state.heartbeatWatchdog = watchdog
+    mainHandler.postDelayed(watchdog, timeoutMs.toLong())
+  }
+
+  private fun stopHeartbeatWatchdog(streamId: String) {
+    val state = streams[streamId] ?: return
+    state.heartbeatWatchdog?.let { mainHandler.removeCallbacks(it) }
+    state.heartbeatWatchdog = null
+  }
+
+  // Only ever runs if nothing else already ended this connection first (a real completion/error,
+  // or disconnect()/a superseding connect() — all of which cancel this Runnable outright, so a
+  // stale watchdog from an already-ended connection can never reach here). Treated exactly like
+  // any other transport failure: torn down and reported synchronously here, same as disconnect()
+  // does, rather than relying on the reading loop's own IOException handling, which treats a
+  // cancelled call as an already-handled no-op by design.
+  private fun handleHeartbeatTimeout(streamId: String) {
+    val state = streams[streamId] ?: return
+    val call = state.currentCall ?: return
+    state.currentCall = null
+    call.cancel()
+    val timeoutMs = state.heartbeatTimeoutMs ?: 0.0
+    Log.e(LOG_TAG, "[$streamId] heartbeat timeout — no data for ${timeoutMs}ms, treating connection as dead")
+    emitEvent(
+      "onError",
+      Arguments.createMap().apply {
+        putString("streamId", streamId)
+        putString("message", "No data received for ${timeoutMs.toInt()}ms — connection appears dead")
+        putString("type", "timeout")
+      }
+    )
+    emitEvent("onClose", Arguments.createMap().apply { putString("streamId", streamId) })
+    scheduleReconnectIfNeeded(streamId)
   }
 
   // Only fires onStateChange when the state actually changes — callers can transition through
@@ -581,6 +653,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
         streams[streamId]?.reconnectAttempts = 0
         setState(streamId, ConnectionState.OPEN)
         emitEvent("onOpen", Arguments.createMap().apply { putString("streamId", streamId) })
+        resetHeartbeatWatchdog(streamId)
         try {
           val source = response.body?.source()
           if (source == null) {
@@ -596,6 +669,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
               loggedFirstByte = true
             }
             val line = source.readUtf8Line() ?: break
+            resetHeartbeatWatchdog(streamId)
             if (line.isEmpty()) {
               if (eventBuffer.isNotEmpty()) {
                 parseAndEmit(streamId, eventBuffer.toString())
@@ -695,6 +769,13 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
   // stale reconnect Runnable finds nothing here and no-ops.
   private fun scheduleReconnectIfNeeded(streamId: String, httpStatus: Int? = null, wasContentTypeError: Boolean = false) {
     val state = streams[streamId] ?: return
+    // Called from every connection-ending path (HTTP error, content-type error, a dropped/
+    // completed read loop, onFailure) — stopping here, not just at the top of the next
+    // performConnect(), matters because currentCall is NOT nulled after the read loop ends: a
+    // watchdog left running past this point would still see currentCall pointing at the now-dead
+    // call and could fire during the reconnect delay, spuriously re-reporting onError/onClose (or
+    // even re-entering this function) for a connection that already ended.
+    stopHeartbeatWatchdog(streamId)
     if (!state.reconnectEnabled) {
       setState(streamId, ConnectionState.CLOSED)
       return
@@ -749,6 +830,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     state.pendingReconnect?.let { mainHandler.removeCallbacks(it) }
     state.pendingBeforeRequestTimeout?.let { mainHandler.removeCallbacks(it) }
     stopNetworkMonitoring(streamId)
+    stopHeartbeatWatchdog(streamId)
     state.currentCall?.let { emitCloseMetrics(streamId, it) }
     val hadActiveCall = state.currentCall != null
     state.currentCall?.cancel()
@@ -819,15 +901,88 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     val state = streams[streamId] ?: return
     if (state.eventFilter.isNotEmpty() && !state.eventFilter.contains(resolvedType)) return
 
+    val joinedData = dataLines.joinToString("\n")
+    val parsedData = if (state.autoParseJSON) tryParseJSONObject(joinedData) else null
     emitEvent(
       "onMessage",
       Arguments.createMap().apply {
         putString("streamId", streamId)
-        putString("data", dataLines.joinToString("\n"))
+        putString("data", joinedData)
         if (id != null) putString("id", id)
         if (eventName != null) putString("event", eventName)
+        if (parsedData != null) putMap("parsedData", parsedData)
       }
     )
+  }
+
+  // org.json has no built-in "convert to a WritableMap/WritableArray" walk — JSONObject/JSONArray
+  // stay as their own boxed types otherwise, and RN's bridge only understands its own Writable*
+  // types (or plain String/Boolean/Int/Double) for a dynamic value crossing to JS.
+  // JSONObject.NULL is a sentinel object (not Kotlin null) for an explicit JSON `null` value;
+  // mapped to a real WritableMap/Array putNull()/pushNull() here rather than left as the sentinel.
+  private fun jsonToWritable(value: Any?): Any? {
+    return when (value) {
+      null, JSONObject.NULL -> null
+      is JSONObject -> {
+        val map = Arguments.createMap()
+        val keys = value.keys()
+        while (keys.hasNext()) {
+          val key = keys.next()
+          putDynamic(map, key, jsonToWritable(value.get(key)))
+        }
+        map
+      }
+      is JSONArray -> {
+        val array = Arguments.createArray()
+        for (i in 0 until value.length()) {
+          pushDynamic(array, jsonToWritable(value.get(i)))
+        }
+        array
+      }
+      else -> value
+    }
+  }
+
+  private fun putDynamic(map: WritableMap, key: String, value: Any?) {
+    when (value) {
+      null -> map.putNull(key)
+      is String -> map.putString(key, value)
+      is Boolean -> map.putBoolean(key, value)
+      is Int -> map.putInt(key, value)
+      is Long -> map.putDouble(key, value.toDouble())
+      is Double -> map.putDouble(key, value)
+      is WritableMap -> map.putMap(key, value)
+      is WritableArray -> map.putArray(key, value)
+      else -> map.putString(key, value.toString())
+    }
+  }
+
+  private fun pushDynamic(array: WritableArray, value: Any?) {
+    when (value) {
+      null -> array.pushNull()
+      is String -> array.pushString(value)
+      is Boolean -> array.pushBoolean(value)
+      is Int -> array.pushInt(value)
+      is Long -> array.pushDouble(value.toDouble())
+      is Double -> array.pushDouble(value)
+      is WritableMap -> array.pushMap(value)
+      is WritableArray -> array.pushArray(value)
+      else -> array.pushString(value.toString())
+    }
+  }
+
+  // Mirrors the iOS side's tryParseJSONObject: only a top-level JSON *object* counts (a bare
+  // array/string/number/etc. returns null). Best-effort — any parse failure (invalid JSON, wrong
+  // top-level type) is swallowed and reported as "not parsed" rather than as an error, since
+  // malformed data on one message shouldn't disrupt the stream.
+  private fun tryParseJSONObject(text: String): WritableMap? {
+    return try {
+      val parsed = JSONTokener(text).nextValue()
+      if (parsed !is JSONObject) return null
+      jsonToWritable(parsed) as? WritableMap
+    } catch (e: Exception) {
+      null
+    }
   }
 
   private fun emitCloseMetrics(streamId: String, call: Call) {

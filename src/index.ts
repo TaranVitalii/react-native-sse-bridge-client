@@ -12,6 +12,12 @@ export interface SSEMessageEvent {
   id?: string;
   event: string;
   data: string;
+  /** When SSEStreamOptions.autoParseJSON is true, and `data` is valid JSON whose top-level value
+   * is an object, this holds the already-parsed result — parsed natively so `JSON.parse(data)`
+   * doesn't have to run again on the JS thread for every message. Undefined if autoParseJSON is
+   * off, or if `data` isn't a JSON object (invalid JSON, or a bare array/string/number at the top
+   * level — rare in practice for SSE payloads). */
+  parsedData?: Record<string, unknown>;
 }
 
 /**
@@ -20,8 +26,9 @@ export interface SSEMessageEvent {
  * 'invalid-content-type': the server responded 2xx, but with a Content-Type other than
  * `text/event-stream` — usually a misconfigured server/proxy (a login redirect page, a JSON
  * error body dressed up as 200, etc). `message` describes what was received.
- * 'timeout': the request's own timeout (SSESessionOptions.timeoutSeconds) elapsed with no
- * response.
+ * 'timeout': either the request's own timeout (SSESessionOptions.timeoutSeconds) elapsed with no
+ * response, or SSEReconnectOptions.heartbeatTimeoutMs elapsed with no data on an already-open
+ * connection.
  * 'network': a transport-level failure (DNS, connection refused, TLS, dropped connection, etc.)
  * — `message` is the OS's own error description.
  * 'exception': the call couldn't even be attempted (e.g. an invalid URL).
@@ -110,6 +117,21 @@ export interface SSEReconnectOptions {
    * unconditionally, matching pre-network-monitoring behavior.
    */
   monitorNetwork?: boolean;
+  /**
+   * Default undefined (disabled). When set, this stream tracks how long it's been since any
+   * bytes at all were received on an open connection — including SSE `:` comment lines, which
+   * many servers send purely as keep-alive heartbeats, carrying no `data:`. If that goes longer
+   * than this many ms with nothing arriving, the connection is treated as dead (silently dropped
+   * by a NAT/proxy without a clean TCP close, the far more common failure mode than an explicit
+   * error) and torn down proactively — reported via onError (type 'timeout') and reconnected
+   * through the normal backoff/maxAttempts path — rather than waiting for the OS's own
+   * (typically much longer, e.g. SSESessionOptions.timeoutSeconds's default 3600s) timeout to
+   * eventually notice. Left disabled by default because it's a heuristic — a legitimately quiet
+   * stream (no data, no heartbeat) for longer than whatever value you'd pick will trigger a
+   * spurious reconnect, so only enable it with a value comfortably longer than your server's
+   * actual heartbeat interval (if you don't know it, this feature isn't for that server).
+   */
+  heartbeatTimeoutMs?: number;
 }
 
 /**
@@ -175,6 +197,9 @@ export interface SSEStreamOptions {
    * reported via onError (type 'invalid-content-type') instead of being treated as open. Set
    * false for a server that's valid SSE but sends a different/no Content-Type. */
   validateContentType?: boolean;
+  /** Default false. When true, every SSEMessageEvent whose `data` is a JSON object also gets
+   * `parsedData` populated — see SSEMessageEvent.parsedData. */
+  autoParseJSON?: boolean;
 }
 
 type Unsubscribe = () => void;
@@ -222,6 +247,7 @@ interface NativeMessagePayload {
   id?: string;
   event?: string;
   data: string;
+  parsedData?: Record<string, unknown>;
 }
 
 interface NativeErrorPayload {
@@ -421,7 +447,12 @@ export class SSEStream {
 
   private dispatchMessage(raw: NativeMessagePayload): void {
     const type = raw.event ?? DEFAULT_MESSAGE_TYPE;
-    const event: SSEMessageEvent = { id: raw.id, event: type, data: raw.data };
+    const event: SSEMessageEvent = {
+      id: raw.id,
+      event: type,
+      data: raw.data,
+      parsedData: raw.parsedData,
+    };
     this.messageListeners.get(type)?.forEach((cb) => cb(event));
   }
 

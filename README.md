@@ -134,6 +134,9 @@ interface SSEMessageEvent {
   id?: string
   event: string
   data: string
+  // Populated only when SSEStreamOptions.autoParseJSON is true and `data` is a JSON object — see
+  // "Auto-parsing JSON payloads" below.
+  parsedData?: Record<string, unknown>
 }
 
 interface SSEConnectionMetrics {
@@ -143,7 +146,8 @@ interface SSEConnectionMetrics {
 // 'http': non-2xx response — statusCode and message (the response body) are populated.
 // 'invalid-content-type': a 2xx response whose Content-Type wasn't text/event-stream (only
 // reported when validateContentType is true, the default) — message describes what was received.
-// 'timeout': the request's own timeout (SSESessionOptions.timeoutSeconds) elapsed.
+// 'timeout': either the request's own timeout (SSESessionOptions.timeoutSeconds) elapsed, or
+// SSEReconnectOptions.heartbeatTimeoutMs elapsed with no data on an already-open connection.
 // 'network': a transport-level failure (DNS, connection refused, TLS, dropped connection, etc.).
 // 'exception': the call couldn't even be attempted (e.g. an invalid URL).
 type SSEErrorType = 'http' | 'invalid-content-type' | 'network' | 'timeout' | 'exception'
@@ -161,6 +165,9 @@ interface SSEStreamOptions {
   method?: string // default 'GET'; use 'POST' (with `body`) for APIs that stream to a request body
   body?: string // raw request body (e.g. JSON.stringify(...)); set Content-Type via `headers`
   validateContentType?: boolean // default true — see SSEErrorType 'invalid-content-type' above
+  // Default false. When true, every SSEMessageEvent whose `data` is a JSON object also gets
+  // `parsedData` populated — see "Auto-parsing JSON payloads" below.
+  autoParseJSON?: boolean
 }
 
 interface SSESessionOptions {
@@ -188,6 +195,9 @@ interface SSEReconnectOptions {
   // device has no network connectivity at all, resuming immediately once it's back — see
   // "Network-aware pause/resume" below.
   monitorNetwork?: boolean
+  // Default undefined (disabled). Treats the connection as dead if no data at all (including
+  // SSE `:` heartbeat comments) arrives within this many ms — see "Heartbeat watchdog" below.
+  heartbeatTimeoutMs?: number
 }
 
 // 'idle': never connected, or destroy()ed — the initial state.
@@ -284,6 +294,37 @@ stream.connect(url, {
 ```
 
 On Android this requires the `android.permission.ACCESS_NETWORK_STATE` permission, which the library declares in its own manifest (merged into your app's automatically) — most React Native apps already have it via other dependencies.
+
+## Heartbeat watchdog
+
+Some servers/proxies drop a connection silently — no TCP close, no error — leaving the client waiting on a socket that will never receive anything again. The OS eventually notices, but typically only after a very long timeout (`SSESessionOptions.timeoutSeconds` defaults to `3600`). `reconnect.heartbeatTimeoutMs` gives you a much tighter, application-level bound:
+
+```ts
+stream.connect(url, {
+  reconnect: { heartbeatTimeoutMs: 30000 }, // server sends a `:` comment every ~15s
+})
+```
+
+While set, the stream tracks how long it's been since *any* data arrived on an open connection — including bare `:` comment lines, which many SSE servers send purely as keep-alives and which never reach `addEventListener`. If that goes longer than `heartbeatTimeoutMs` with nothing arriving, the connection is torn down proactively and reported via `onError` (`type: 'timeout'`), then reconnected through the normal backoff/`maxAttempts` path — same as any other retryable error.
+
+Disabled by default (`undefined`) because it's a heuristic: a legitimately quiet stream (no data, no heartbeat) for longer than whatever value you pick will trigger a spurious reconnect. Only enable it with a value comfortably longer than your server's actual heartbeat interval — if you don't know that interval, this feature isn't for that server.
+
+## Auto-parsing JSON payloads
+
+Most SSE APIs (LLM chat-completion endpoints especially) send a JSON object as `data` on every message. Rather than calling `JSON.parse(event.data)` yourself on the JS thread for every single message, set `autoParseJSON: true` to have the native side parse it for you:
+
+```ts
+stream.connect(url, { autoParseJSON: true })
+
+stream.addEventListener('message', (event) => {
+  if (event.parsedData) {
+    // already parsed — no JSON.parse(event.data) needed
+    console.log(event.parsedData.choices)
+  }
+})
+```
+
+`parsedData` is only populated when `data` is valid JSON *and* its top-level value is an object (`{...}`) — a bare array/string/number at the top level, or invalid JSON, leaves it `undefined` and `data` is still there as a fallback.
 
 ## Connection state
 
