@@ -1,0 +1,99 @@
+name: Build iOS
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/ios-build.yml'
+      - 'example/ios/**'
+      - 'example/Gemfile'
+      - 'example/Gemfile.lock'
+      - 'ios/**'
+      - '**/Podfile.lock'
+      - '**/package-lock.json'
+      - '**/*.podspec'
+      - '**/react-native.config.js'
+  # No path filter here (unlike the push trigger above): this check is required by branch
+  # protection on main, and a required check that never runs on a given PR leaves that PR
+  # permanently unmergeable. Always running on every PR keeps it reliable.
+  pull_request: {}
+  workflow_dispatch:
+
+env:
+  USE_CCACHE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build iOS Example App
+    runs-on: macOS-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 16.4
+
+      - name: Install dependencies
+        run: npm ci
+
+      # example/ is a standalone package (its own package-lock.json, own node_modules) — it isn't
+      # an npm workspace of the root, and is wired to this library via react-native.config.js's
+      # manual `dependencies` entry rather than a package.json dependency, so installing at the
+      # root alone never populates it. Without this, `pod install` below fails because
+      # @react-native-community/cli (used by `use_native_modules!` in the Podfile) isn't present.
+      - name: Install example dependencies
+        working-directory: example
+        run: npm ci
+
+      - name: Setup Ruby (bundle)
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+          working-directory: example/ios
+
+      - name: Install xcpretty
+        run: gem install xcpretty
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cocoapods/repos
+            example/ios/Pods
+          key: ${{ runner.os }}-pods-${{ hashFiles('example/ios/Podfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Install Pods
+        working-directory: example/ios
+        run: pod install
+
+      - name: Build App
+        working-directory: example/ios
+        run: |
+          set -o pipefail && xcodebuild \
+            CC=clang CPLUSPLUS=clang++ LD=clang LDPLUSPLUS=clang++ \
+            -derivedDataPath build -UseModernBuildSystem=YES \
+            -workspace ReactNativeSSEBridgeClientExample.xcworkspace \
+            -scheme ReactNativeSSEBridgeClientExample \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 17' \
+            build \
+            CODE_SIGNING_ALLOWED=NO | xcpretty
