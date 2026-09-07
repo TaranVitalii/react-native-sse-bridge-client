@@ -48,6 +48,9 @@ stream.onClose(() => console.log('closed'))
 // fires once, when the connection closes (disconnect(), a superseding connect(), or a failure)
 stream.onMetrics(metrics => console.log('connection reused:', metrics.connectionReused))
 
+// state is 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed' | 'failed'
+stream.onStateChange(state => console.log('state:', state))
+
 stream.connect('https://your-server.example.com/events', {
   headers: { Authorization: 'Bearer …' },
 })
@@ -95,6 +98,8 @@ Sets the shared session config (timeout, max connections per host) once, up fron
 | `onError(callback: (error: SSEError) => void): () => void` | Fires on a non-2xx HTTP response, a Content-Type mismatch (unless `validateContentType: false`), a network/transport failure, a timeout, or an invalid URL — see [Types](#types) below for `SSEError`. Not called for a `disconnect()` you initiated yourself. |
 | `onClose(callback: () => void): () => void` | Fires whenever the connection ends, for any reason — a normal server-side close, right after `onError`, or an explicit `disconnect()`. Fires again after every automatic reconnect's connection ends, so it does not mean the stream gave up. |
 | `onMetrics(callback: (metrics: SSEConnectionMetrics) => void): () => void` | Fires once per connection, when it ends — see below. Like `addEventListener`, whether this has any listener is pushed down natively; with none, the event is dropped before it crosses the bridge. |
+| `onStateChange(callback: (state: SSEConnectionState) => void): () => void` | Fires on every connection-state transition — see [Connection state](#connection-state) below. Only fires when the state actually changes. |
+| `getState(): SSEConnectionState` | The stream's current connection state — see [Connection state](#connection-state) below. Always up to date; doesn't require an `onStateChange` listener to be registered. |
 | `destroy(): void` | Disconnects, drops every listener, and unsubscribes from the shared native event emitter. Call this when you're done with the stream (e.g. on unmount). |
 
 ### Event-type filtering happens natively
@@ -144,13 +149,31 @@ interface SSESessionOptions {
 
 interface SSEReconnectOptions {
   enabled?: boolean // default true
-  intervalMs?: number // default 3000; overridden per-stream by a server `retry:` field
+  // Base delay before the first reconnect attempt, in ms. Default 3000; overridden per-stream by
+  // a server `retry:` field. Each consecutive failed attempt doubles the delay from here — see
+  // maxIntervalMs/jitterFactor — this is a starting point, not a flat per-attempt delay.
+  intervalMs?: number
+  maxIntervalMs?: number // cap on the exponential backoff delay, in ms. Default 30000
+  // Randomizes each computed delay by this fraction (0.0-1.0) — e.g. 0.5 turns a computed 4000ms
+  // delay into a random value in [3000, 5000], so many clients don't retry in lockstep after a
+  // shared outage. Default 0.5. 0 disables jitter.
+  jitterFactor?: number
   maxAttempts?: number // default undefined (retry forever); resets to 0 after a successful onOpen
   // Default false. A 4xx response or a Content-Type mismatch does NOT trigger a reconnect by
   // default (except 429, which always retries) — that class of failure usually means retrying
   // identically won't help. Set true to retry every HTTP error, including 4xx.
   retryOnClientError?: boolean
 }
+
+// 'idle': never connected, or destroy()ed — the initial state.
+// 'connecting': an explicit connect() call's first attempt is in flight.
+// 'open': the connection is live, after onOpen.
+// 'reconnecting': an automatic retry is pending (waiting out the backoff delay) or in flight.
+// 'closed': ended intentionally — disconnect(), or the connection ended while reconnect.enabled
+// was false.
+// 'failed': automatic reconnect gave up — a non-retryable error, or reconnect.maxAttempts was
+// reached. A fresh connect() is needed to try again.
+type SSEConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed' | 'failed'
 ```
 
 ### Configuring the shared session
@@ -197,17 +220,41 @@ A full per-phase timing breakdown (DNS/connect/TLS/TTFB) is still logged nativel
 
 Reconnecting is automatic by default, mirroring the browser `EventSource` model (and `react-native-sse`): whenever a connection ends for any reason other than your own `disconnect()` — a non-2xx response, a network/timeout error, or the server just closing the stream normally — the stream reconnects to the same URL after a delay.
 
-- **Delay**: starts at `reconnect.intervalMs` (default `3000`). A `retry:` field in the stream overrides it for that stream's *next* reconnects — there's no exponential backoff on top of that, matching `react-native-sse`'s behavior.
+- **Delay**: exponential backoff with jitter, starting at `reconnect.intervalMs` (default `3000`). Each consecutive failed attempt doubles the delay, capped at `reconnect.maxIntervalMs` (default `30000`), then randomized by `reconnect.jitterFactor` (default `0.5`) — e.g. attempts go roughly `3000ms → 6000ms → 12000ms → ...`, each jittered by ±25% (half of `jitterFactor`), up to the cap. A `retry:` field in the stream overrides the base (`intervalMs`) for that stream's *next* reconnects, and backoff resumes doubling from there. A successful `onOpen` resets the attempt counter, so the next failure starts back at the base delay.
 - **`Last-Event-ID`**: if any received event had an `id:` field, it's sent as the `Last-Event-ID` header on the next automatic reconnect, so a server that supports it can resume from where it left off. An explicit `connect()` call always starts a fresh logical session — it does not send a stale `Last-Event-ID` from before.
-- **Giving up**: set `reconnect.maxAttempts` to stop retrying after that many consecutive failures (default: retry forever). The counter resets to 0 after any successful `onOpen`.
+- **Giving up**: set `reconnect.maxAttempts` to stop retrying after that many consecutive failures (default: retry forever). The counter resets to 0 after any successful `onOpen`. Giving up moves the stream to the `'failed'` state — see [Connection state](#connection-state) below.
 - **Client errors**: a 4xx response or a Content-Type mismatch (see `validateContentType`) does **not** trigger a reconnect by default — retrying an identical request against a 401/403/404/etc. usually just repeats the same failure. The one default exception is `429` (rate limited), which always retries. Set `reconnect.retryOnClientError: true` to retry every HTTP error, including 4xx. 5xx, network, and timeout errors always retry (subject to `maxAttempts`), regardless of this setting.
 - **Opting out**: `stream.connect(url, { reconnect: { enabled: false } })` disables it entirely — call `connect()` yourself (e.g. from `onError`/`onClose`) to drive reconnection your own way.
 
 ```ts
 stream.connect(url, {
-  reconnect: { intervalMs: 5000, maxAttempts: 5 },
+  reconnect: { intervalMs: 1000, maxIntervalMs: 20000, jitterFactor: 0.3, maxAttempts: 10 },
 })
 ```
+
+## Connection state
+
+`getState()`/`onStateChange` expose the stream's connection lifecycle as an explicit `SSEConnectionState` — handy for driving a "reconnecting…" indicator without piecing it together from `onOpen`/`onError`/`onClose` yourself:
+
+```
+idle ──connect()──> connecting ──onOpen──> open
+                        │                    │
+                        │ (error/close)      │ (error/close)
+                        ▼                    ▼
+                    reconnecting <───────────┘
+                     │        │
+      (retryable,    │        │ (non-retryable, or
+       under          │        │  maxAttempts reached)
+       maxAttempts)   ▼        ▼
+                     open    failed
+
+disconnect() (from any state) ──> closed
+reconnect.enabled: false, connection ends ──> closed
+```
+
+- `'reconnecting'` covers both "waiting out the backoff delay" and "the retry attempt itself in flight" — it doesn't flip back to `'connecting'` for each individual attempt.
+- `'failed'` is terminal for that logical session — a client error (`retryOnClientError` not set) or an exhausted `maxAttempts` gave up. Call `connect()` again to start a fresh session.
+- `onStateChange` only fires when the state actually changes — no duplicate events for repeated transitions into the same state.
 
 ## How it's built
 
