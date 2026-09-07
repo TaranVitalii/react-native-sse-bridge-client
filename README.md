@@ -38,7 +38,12 @@ stream.addEventListener('message', event => {
   console.log(event.event, event.data) // event.id is optional per the SSE spec
 })
 
-stream.onError(message => console.log('error:', message))
+// error.type is 'http' | 'network' | 'timeout' | 'exception'; error.statusCode is set for 'http'
+stream.onError(error => console.log('error:', error.type, error.message))
+
+// fires whenever the connection ends, for any reason — including the automatic reconnect this
+// library does by default, so this doesn't mean the stream gave up
+stream.onClose(() => console.log('closed'))
 
 // fires once, when the connection closes (disconnect(), a superseding connect(), or a failure)
 stream.onMetrics(metrics => console.log('connection reused:', metrics.connectionReused))
@@ -70,8 +75,9 @@ Sets the shared session config (timeout, max connections per host) once, up fron
 | `connect(url: string, options?: SSEStreamOptions): void` | Opens a connection to `url`. Calling this again on the same stream cancels the previous connection first (its close metrics still fire). Headers — including `User-Agent` — are entirely JS-configured; nothing is hardcoded natively. |
 | `disconnect(): void` | Closes the current connection, if any. |
 | `addEventListener(type: string, callback: (event: SSEMessageEvent) => void): () => void` | Subscribes to a specific SSE `event:` type, mirroring the browser `EventSource` model — frames with no `event:` field (or `event: message`) are filed under `'message'`. Returns an unsubscribe function. |
-| `onOpen(callback: () => void): () => void` | Fires when the server responds (response headers received). |
-| `onError(callback: (message: string) => void): () => void` | Fires on a network/transport failure. Not called for a `disconnect()` you initiated yourself. |
+| `onOpen(callback: () => void): () => void` | Fires when the server responds with a successful (2xx) status. |
+| `onError(callback: (error: SSEError) => void): () => void` | Fires on a non-2xx HTTP response, a network/transport failure, a timeout, or an invalid URL — see [Types](#types) below for `SSEError`. Not called for a `disconnect()` you initiated yourself. |
+| `onClose(callback: () => void): () => void` | Fires whenever the connection ends, for any reason — a normal server-side close, right after `onError`, or an explicit `disconnect()`. Fires again after every automatic reconnect's connection ends, so it does not mean the stream gave up. |
 | `onMetrics(callback: (metrics: SSEConnectionMetrics) => void): () => void` | Fires once per connection, when it ends — see below. Like `addEventListener`, whether this has any listener is pushed down natively; with none, the event is dropped before it crosses the bridge. |
 | `destroy(): void` | Disconnects, drops every listener, and unsubscribes from the shared native event emitter. Call this when you're done with the stream (e.g. on unmount). |
 
@@ -92,14 +98,33 @@ interface SSEConnectionMetrics {
   connectionReused: boolean
 }
 
+// 'http': non-2xx response — statusCode and message (the response body) are populated.
+// 'timeout': the request's own timeout (SSESessionOptions.timeoutSeconds) elapsed.
+// 'network': a transport-level failure (DNS, connection refused, TLS, dropped connection, etc.).
+// 'exception': the call couldn't even be attempted (e.g. an invalid URL).
+type SSEErrorType = 'http' | 'network' | 'timeout' | 'exception'
+
+interface SSEError {
+  message: string
+  type: SSEErrorType
+  statusCode?: number // only set when type is 'http'
+}
+
 interface SSEStreamOptions {
   headers?: Record<string, string>
   session?: SSESessionOptions
+  reconnect?: SSEReconnectOptions
 }
 
 interface SSESessionOptions {
   timeoutSeconds?: number
   maxConnectionsPerHost?: number
+}
+
+interface SSEReconnectOptions {
+  enabled?: boolean // default true
+  intervalMs?: number // default 3000; overridden per-stream by a server `retry:` field
+  maxAttempts?: number // default undefined (retry forever); resets to 0 after a successful onOpen
 }
 ```
 
@@ -145,7 +170,18 @@ A full per-phase timing breakdown (DNS/connect/TLS/TTFB) is still logged nativel
 
 ## How reconnects work
 
-Reconnecting is entirely manual: call `connect()` again (optionally after `disconnect()`) whenever you want to. There is no built-in auto-reconnect or backoff on top of the server's `retry:` field — this is intentional for v1, so nothing sits between you and the exact moment a reconnect happens. If you need resilience against dropped connections, drive `connect()`/`disconnect()` from your own retry logic (e.g. on `onError`).
+Reconnecting is automatic by default, mirroring the browser `EventSource` model (and `react-native-sse`): whenever a connection ends for any reason other than your own `disconnect()` — a non-2xx response, a network/timeout error, or the server just closing the stream normally — the stream reconnects to the same URL after a delay.
+
+- **Delay**: starts at `reconnect.intervalMs` (default `3000`). A `retry:` field in the stream overrides it for that stream's *next* reconnects — there's no exponential backoff on top of that, matching `react-native-sse`'s behavior.
+- **`Last-Event-ID`**: if any received event had an `id:` field, it's sent as the `Last-Event-ID` header on the next automatic reconnect, so a server that supports it can resume from where it left off. An explicit `connect()` call always starts a fresh logical session — it does not send a stale `Last-Event-ID` from before.
+- **Giving up**: set `reconnect.maxAttempts` to stop retrying after that many consecutive failures (default: retry forever). The counter resets to 0 after any successful `onOpen`.
+- **Opting out**: `stream.connect(url, { reconnect: { enabled: false } })` disables it entirely — call `connect()` yourself (e.g. from `onError`/`onClose`) to drive reconnection your own way.
+
+```ts
+stream.connect(url, {
+  reconnect: { intervalMs: 5000, maxAttempts: 5 },
+})
+```
 
 ## How it's built
 

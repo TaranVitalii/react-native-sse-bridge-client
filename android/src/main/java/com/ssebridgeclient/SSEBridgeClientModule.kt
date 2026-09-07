@@ -1,5 +1,7 @@
 package com.ssebridgeclient
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactApplicationContext
@@ -18,12 +20,19 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okio.Buffer
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 
 private const val LOG_TAG = "BridgeSSE"
+private const val DEFAULT_RECONNECT_INTERVAL_MS = 3000.0
+
+// Error responses (4xx/5xx) are typically small JSON/HTML bodies — bounded so a misbehaving
+// server streaming an enormous error page can't grow this unboundedly before completion.
+private const val MAX_ERROR_BODY_BYTES = 8192L
 
 private class CallTimings {
   var connectStart: Long? = null
@@ -66,11 +75,26 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     // event is dropped before it crosses the bridge — same idea as eventFilter, just a single
     // flag since there's only one metrics event (fired once, on close) rather than a set of types.
     var metricsEnabled = false
+
+    // Reconnect state. connectUrl/headers are remembered so an automatic reconnect can repeat
+    // the same connect() call; reconnectEnabled/reconnectMaxAttempts come from the caller's
+    // SSEReconnectOptions, resolved once per explicit connect(). reconnectIntervalMs starts at
+    // options.intervalMs (default 3s) and is overridden per-stream by a `retry:` field from the
+    // server; it resets back to the option's value on the next *explicit* connect().
+    var connectUrl: String? = null
+    var headers: Map<String, String>? = null
+    var reconnectEnabled = true
+    var reconnectIntervalMs = DEFAULT_RECONNECT_INTERVAL_MS
+    var reconnectMaxAttempts: Double? = null
+    var reconnectAttempts = 0
+    var pendingReconnect: Runnable? = null
+    var lastEventId: String? = null
   }
 
   private val streams = mutableMapOf<String, StreamState>()
   private val timingsByGeneration = mutableMapOf<Int, CallTimings>()
   private var generationCounter = 0
+  private val mainHandler = Handler(Looper.getMainLooper())
 
   // Lazily created — see sharedClient(options:) below.
   private var client: OkHttpClient? = null
@@ -149,7 +173,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     // Validated before touching any existing connection, so a bad URL on a reconnect attempt
     // doesn't tear down a connection that was working fine — and reported through onError like
     // any other connection failure, rather than left to crash as an uncaught IllegalArgumentException.
-    val requestBuilder = try {
+    try {
       Request.Builder().url(url)
     } catch (e: IllegalArgumentException) {
       Log.e(LOG_TAG, "[$streamId] invalid URL: $url", e)
@@ -158,23 +182,55 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
         Arguments.createMap().apply {
           putString("streamId", streamId)
           putString("message", "Invalid URL: $url")
+          putString("type", "exception")
         }
       )
       return
     }
 
+    streams[streamId]?.pendingReconnect?.let { mainHandler.removeCallbacks(it) }
     streams[streamId]?.currentCall?.let { emitCloseMetrics(streamId, it) }
     streams[streamId]?.currentCall?.cancel()
 
     val state = StreamState()
     state.connectStartedAt = System.nanoTime()
+    state.connectUrl = url
+    state.headers = options?.getMap("headers")?.let { h ->
+      val map = mutableMapOf<String, String>()
+      val iterator = h.keySetIterator()
+      while (iterator.hasNextKey()) {
+        val key = iterator.nextKey()
+        h.getString(key)?.let { map[key] = it }
+      }
+      map
+    }
     val eventTypes = options?.getArray("eventTypes")
     if (eventTypes != null && eventTypes.size() > 0) {
       state.eventFilter = (0 until eventTypes.size()).mapNotNull { eventTypes.getString(it) }.toSet()
     }
     state.metricsEnabled = options?.hasKey("metricsEnabled") == true && options.getBoolean("metricsEnabled")
-    streams[streamId] = state
 
+    val reconnectOptions = options?.getMap("reconnect")
+    state.reconnectEnabled = if (reconnectOptions?.hasKey("enabled") == true) reconnectOptions.getBoolean("enabled") else true
+    state.reconnectIntervalMs = if (reconnectOptions?.hasKey("intervalMs") == true) reconnectOptions.getDouble("intervalMs") else DEFAULT_RECONNECT_INTERVAL_MS
+    state.reconnectMaxAttempts = if (reconnectOptions?.hasKey("maxAttempts") == true) reconnectOptions.getDouble("maxAttempts") else null
+
+    streams[streamId] = state
+    // `options` (session config) is only ever consulted on the very first connect() made across
+    // ALL streams — see sharedClient(options:) — so it's fine that reconnects (which call
+    // performConnect directly, not through here) don't have it to hand.
+    sharedClient(options)
+
+    performConnect(streamId, isReconnect = false)
+  }
+
+  private fun performConnect(streamId: String, isReconnect: Boolean) {
+    val state = streams[streamId] ?: return
+    val url = state.connectUrl ?: return
+    val requestBuilder = Request.Builder().url(url)
+
+    state.firstByteLogged = false
+    state.connectStartedAt = System.nanoTime()
     generationCounter += 1
     val generation = generationCounter
 
@@ -182,17 +238,15 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
       .header("Accept", "text/event-stream")
       .tag(ConnectionAttempt::class.java, ConnectionAttempt(streamId, generation))
 
-    val headers = options?.getMap("headers")
-    headers?.let { h ->
-      val iterator = h.keySetIterator()
-      while (iterator.hasNextKey()) {
-        val key = iterator.nextKey()
-        val value = h.getString(key)
-        if (value != null) requestBuilder.header(key, value)
-      }
+    state.headers?.forEach { (key, value) -> requestBuilder.header(key, value) }
+
+    // Only sent on an automatic reconnect that has actually seen an id: field — an explicit
+    // connect() always starts a fresh logical session (lastEventId is unset on a fresh StreamState).
+    if (isReconnect) {
+      state.lastEventId?.let { requestBuilder.header("Last-Event-ID", it) }
     }
 
-    val call = sharedClient(options).newCall(requestBuilder.build())
+    val call = sharedClient(null).newCall(requestBuilder.build())
     state.currentCall = call
 
     call.enqueue(object : Callback {
@@ -205,6 +259,27 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
           response.close()
           return
         }
+
+        if (!response.isSuccessful) {
+          val statusCode = response.code
+          val bodyString = readBoundedBody(response)
+          response.close()
+          Log.e(LOG_TAG, "[$streamId] HTTP error: $statusCode")
+          emitEvent(
+            "onError",
+            Arguments.createMap().apply {
+              putString("streamId", streamId)
+              putString("message", bodyString)
+              putString("type", "http")
+              putDouble("statusCode", statusCode.toDouble())
+            }
+          )
+          emitEvent("onClose", Arguments.createMap().apply { putString("streamId", streamId) })
+          scheduleReconnectIfNeeded(streamId)
+          return
+        }
+
+        streams[streamId]?.reconnectAttempts = 0
         emitEvent("onOpen", Arguments.createMap().apply { putString("streamId", streamId) })
         try {
           val source = response.body?.source()
@@ -231,10 +306,29 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
             }
           }
         } catch (e: IOException) {
-          // Stream ended, or was cancelled by disconnect()/a superseding connect() — expected.
+          // Cancelled by disconnect()/a superseding connect() — expected, already handled
+          // elsewhere (disconnect() fires onClose synchronously; a superseding call's own
+          // lifecycle governs). Anything else reaching here is a genuine mid-stream failure.
+          if (!call.isCanceled() && streams[streamId]?.currentCall === call) {
+            Log.e(LOG_TAG, "[$streamId] connection dropped: ${e.message}", e)
+            val type = if (e is SocketTimeoutException) "timeout" else "network"
+            emitEvent(
+              "onError",
+              Arguments.createMap().apply {
+                putString("streamId", streamId)
+                putString("message", e.message ?: e.toString())
+                putString("type", type)
+              }
+            )
+          }
         } finally {
           emitCloseMetrics(streamId, call)
           response.close()
+        }
+
+        if (streams[streamId]?.currentCall === call) {
+          emitEvent("onClose", Arguments.createMap().apply { putString("streamId", streamId) })
+          scheduleReconnectIfNeeded(streamId)
         }
       }
 
@@ -245,23 +339,62 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
         // superseded shouldn't surface as "the current connection failed" — it isn't, anymore.
         if (streams[streamId]?.currentCall !== call) return
         Log.e(LOG_TAG, "[$streamId] connect failed: ${e.message}", e)
+        val type = if (e is SocketTimeoutException) "timeout" else "network"
         emitEvent(
           "onError",
           Arguments.createMap().apply {
             putString("streamId", streamId)
             putString("message", e.message ?: e.toString())
+            putString("type", type)
           }
         )
+        emitEvent("onClose", Arguments.createMap().apply { putString("streamId", streamId) })
+        scheduleReconnectIfNeeded(streamId)
       }
     })
+  }
+
+  private fun readBoundedBody(response: Response): String {
+    val source = response.body?.source() ?: return ""
+    return try {
+      val buffer = Buffer()
+      while (buffer.size < MAX_ERROR_BODY_BYTES && !source.exhausted()) {
+        val read = source.read(buffer, MAX_ERROR_BODY_BYTES - buffer.size)
+        if (read == -1L) break
+      }
+      buffer.readUtf8()
+    } catch (e: IOException) {
+      ""
+    }
+  }
+
+  // Presence of `streams[streamId]` is what distinguishes "still an active stream, just between
+  // connections" from "disconnect() was called" — disconnect() removes the entry entirely, so a
+  // stale reconnect Runnable finds nothing here and no-ops.
+  private fun scheduleReconnectIfNeeded(streamId: String) {
+    val state = streams[streamId] ?: return
+    if (!state.reconnectEnabled) return
+    state.reconnectMaxAttempts?.let { max -> if (state.reconnectAttempts >= max) return }
+    state.reconnectAttempts += 1
+
+    val runnable = Runnable {
+      if (streams[streamId] != null) performConnect(streamId, isReconnect = true)
+    }
+    state.pendingReconnect = runnable
+    mainHandler.postDelayed(runnable, state.reconnectIntervalMs.toLong())
   }
 
   @ReactMethod
   fun disconnect(streamId: String) {
     val state = streams[streamId] ?: return
+    state.pendingReconnect?.let { mainHandler.removeCallbacks(it) }
     state.currentCall?.let { emitCloseMetrics(streamId, it) }
+    val hadActiveCall = state.currentCall != null
     state.currentCall?.cancel()
     streams.remove(streamId)
+    if (hadActiveCall) {
+      emitEvent("onClose", Arguments.createMap().apply { putString("streamId", streamId) })
+    }
   }
 
   @ReactMethod
@@ -306,7 +439,16 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
         line.startsWith("id:") -> id = line.removePrefix("id:").trim()
         line.startsWith("event:") -> eventName = line.removePrefix("event:").trim()
         line.startsWith("data:") -> dataLines.add(line.removePrefix("data:").trim())
+        line.startsWith("retry:") -> {
+          line.removePrefix("retry:").trim().toDoubleOrNull()?.let { streams[streamId]?.reconnectIntervalMs = it }
+        }
       }
+    }
+
+    // An `id:` field (even empty) updates lastEventId for the *next* reconnect's Last-Event-ID
+    // header — empty resets it to unset, matching the SSE spec. Absent leaves it unchanged.
+    if (id != null) {
+      streams[streamId]?.lastEventId = id.ifEmpty { null }
     }
 
     if (dataLines.isEmpty()) return
