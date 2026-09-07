@@ -39,6 +39,11 @@ private const val MAX_ERROR_BODY_BYTES = 8192L
 
 private val METHODS_REQUIRING_BODY = setOf("POST", "PUT", "PATCH", "PROPPATCH", "REPORT")
 
+// If JS never calls provideRequestHeaders() back (a broken onBeforeRequest hook that never
+// resolves/rejects, or a JS-side bug), the request fires anyway after this long rather than
+// hanging the stream forever.
+private const val BEFORE_REQUEST_TIMEOUT_MS = 10_000L
+
 /**
  * 'idle': never connected, or destroy()ed — the initial state.
  * 'connecting': an explicit connect() call's first attempt is in flight.
@@ -128,11 +133,32 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     // Default true — a 2xx response whose Content-Type isn't text/event-stream is reported via
     // onError ('invalid-content-type') instead of being treated as an open stream.
     var validateContentType = true
+
+    // onBeforeRequest support. Classic Native Modules have no built-in way to call into JS and
+    // await a Promise result the way Nitro's HybridObject callbacks can — so this is a
+    // hand-rolled round trip: performConnect() emits "onBeforeRequest" (with a globally unique
+    // requestId, see SSEBridgeClientModule.nextBeforeRequestId) instead of firing the request
+    // immediately; JS resolves its hook and calls back into provideRequestHeaders(streamId,
+    // requestId, headers), which fires the request only if awaitingBeforeRequestId still matches
+    // — i.e. this attempt hasn't been superseded by a newer connect()/reconnect (or disconnect())
+    // in the meantime. pendingBeforeRequestIsReconnect remembers isReconnect across that gap,
+    // since provideRequestHeaders needs it to decide whether to send Last-Event-ID.
+    var hasBeforeRequestListener = false
+    // null when not currently waiting on a round trip. requestId is handed out from a single
+    // process-wide counter (never reset, never reused) specifically so a stale timeout/
+    // provideRequestHeaders() callback from a superseded attempt can never coincidentally collide
+    // with a legitimately-current one — unlike a per-stream counter, which would reset every time
+    // a fresh StreamState replaces this one, e.g. across a disconnect() + reconnect().
+    var awaitingBeforeRequestId: Int? = null
+    var pendingBeforeRequestIsReconnect = false
+    var pendingBeforeRequestTimeout: Runnable? = null
   }
 
   private val streams = mutableMapOf<String, StreamState>()
   private val timingsByGeneration = mutableMapOf<Int, CallTimings>()
   private var generationCounter = 0
+  // Hands out globally unique onBeforeRequest round-trip IDs — see StreamState.awaitingBeforeRequestId.
+  private var nextBeforeRequestId = 0
   private val mainHandler = Handler(Looper.getMainLooper())
 
   // Lazily created — see sharedClient(options:) below.
@@ -261,6 +287,9 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     state.body = if (options?.hasKey("body") == true) options.getString("body") else null
     state.validateContentType = if (options?.hasKey("validateContentType") == true) options.getBoolean("validateContentType") else true
 
+    state.hasBeforeRequestListener = options?.hasKey("hasBeforeRequestListener") == true &&
+      options.getBoolean("hasBeforeRequestListener")
+
     streams[streamId] = state
     // `options` (session config) is only ever consulted on the very first connect() made across
     // ALL streams — see sharedClient(options:) — so it's fine that reconnects (which call
@@ -289,6 +318,74 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
 
   private fun performConnect(streamId: String, isReconnect: Boolean) {
     val state = streams[streamId] ?: return
+
+    // Invalidates any previous attempt still waiting on onBeforeRequest — see
+    // provideRequestHeaders() and the timeout Runnable below.
+    state.pendingBeforeRequestTimeout?.let { mainHandler.removeCallbacks(it) }
+    state.pendingBeforeRequestTimeout = null
+    state.awaitingBeforeRequestId = null
+
+    if (!state.hasBeforeRequestListener) {
+      // Common case: no hook registered — skip the round trip entirely and fire immediately.
+      fireRequest(streamId, isReconnect, emptyMap())
+      return
+    }
+
+    nextBeforeRequestId += 1
+    val requestId = nextBeforeRequestId
+    state.awaitingBeforeRequestId = requestId
+    state.pendingBeforeRequestIsReconnect = isReconnect
+    emitEvent(
+      "onBeforeRequest",
+      Arguments.createMap().apply {
+        putString("streamId", streamId)
+        putInt("requestId", requestId)
+      }
+    )
+
+    val timeout = Runnable {
+      if (streams[streamId]?.awaitingBeforeRequestId != requestId) return@Runnable
+      streams[streamId]?.awaitingBeforeRequestId = null
+      streams[streamId]?.pendingBeforeRequestTimeout = null
+      fireRequest(streamId, isReconnect, emptyMap())
+    }
+    state.pendingBeforeRequestTimeout = timeout
+    mainHandler.postDelayed(timeout, BEFORE_REQUEST_TIMEOUT_MS)
+  }
+
+  @ReactMethod
+  fun setBeforeRequestEnabled(streamId: String, enabled: Boolean) {
+    streams[streamId]?.hasBeforeRequestListener = enabled
+  }
+
+  // Called back by JS once its onBeforeRequest hook resolves (or throws — headers is null/empty
+  // in that case, the request proceeds anyway rather than getting stuck). requestId must match
+  // awaitingBeforeRequestId: if a newer connect()/reconnect (or a disconnect()) has since
+  // superseded this attempt, this callback is stale and is dropped rather than firing an
+  // out-of-date request. requestId is a process-wide, never-reused counter (see
+  // nextBeforeRequestId), so a stale callback can never coincidentally match a legitimately
+  // current one.
+  @ReactMethod
+  fun provideRequestHeaders(streamId: String, requestId: Int, headers: ReadableMap?) {
+    val state = streams[streamId] ?: return
+    if (state.awaitingBeforeRequestId != requestId) return
+    state.awaitingBeforeRequestId = null
+    state.pendingBeforeRequestTimeout?.let { mainHandler.removeCallbacks(it) }
+    state.pendingBeforeRequestTimeout = null
+    val resolvedHeaders = headers?.let { h ->
+      val map = mutableMapOf<String, String>()
+      val iterator = h.keySetIterator()
+      while (iterator.hasNextKey()) {
+        val key = iterator.nextKey()
+        h.getString(key)?.let { map[key] = it }
+      }
+      map
+    } ?: emptyMap()
+    fireRequest(streamId, state.pendingBeforeRequestIsReconnect, resolvedHeaders)
+  }
+
+  private fun fireRequest(streamId: String, isReconnect: Boolean, extraHeaders: Map<String, String>) {
+    val state = streams[streamId] ?: return
     val url = state.connectUrl ?: return
     val requestBuilder = Request.Builder().url(url)
 
@@ -302,6 +399,9 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
       .tag(ConnectionAttempt::class.java, ConnectionAttempt(streamId, generation))
 
     state.headers?.forEach { (key, value) -> requestBuilder.header(key, value) }
+    // onBeforeRequest's result is applied last, so it can override anything above — e.g.
+    // refreshing an Authorization header that connectHeaders set with a now-stale token.
+    extraHeaders.forEach { (key, value) -> requestBuilder.header(key, value) }
     applyMethodAndBody(requestBuilder, state.method, state.body)
 
     // Only sent on an automatic reconnect that has actually seen an id: field — an explicit
@@ -525,6 +625,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
   fun disconnect(streamId: String) {
     val state = streams[streamId] ?: return
     state.pendingReconnect?.let { mainHandler.removeCallbacks(it) }
+    state.pendingBeforeRequestTimeout?.let { mainHandler.removeCallbacks(it) }
     state.currentCall?.let { emitCloseMetrics(streamId, it) }
     val hadActiveCall = state.currentCall != null
     state.currentCall?.cancel()

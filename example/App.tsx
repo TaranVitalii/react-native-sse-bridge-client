@@ -78,6 +78,12 @@ function App(): React.JSX.Element {
         log(`state: ${next}`)
       }),
     ]
+    // Demonstrates onBeforeRequest — awaited before the initial connect() and every automatic
+    // reconnect, the right place to refresh a short-lived auth token.
+    stream.onBeforeRequest = async () => {
+      log('onBeforeRequest: refreshing headers')
+      return { 'X-Example-Token': String(Date.now()) }
+    }
 
     return () => {
       unsubscribers.forEach(unsubscribe => unsubscribe())
