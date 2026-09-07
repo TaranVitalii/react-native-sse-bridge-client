@@ -19,6 +19,7 @@ import okhttp3.Handshake
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okio.Buffer
 import java.io.IOException
@@ -33,6 +34,8 @@ private const val DEFAULT_RECONNECT_INTERVAL_MS = 3000.0
 // Error responses (4xx/5xx) are typically small JSON/HTML bodies — bounded so a misbehaving
 // server streaming an enormous error page can't grow this unboundedly before completion.
 private const val MAX_ERROR_BODY_BYTES = 8192L
+
+private val METHODS_REQUIRING_BODY = setOf("POST", "PUT", "PATCH", "PROPPATCH", "REPORT")
 
 private class CallTimings {
   var connectStart: Long? = null
@@ -89,6 +92,18 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     var reconnectAttempts = 0
     var pendingReconnect: Runnable? = null
     var lastEventId: String? = null
+    // By default, a 4xx response or a Content-Type mismatch does NOT trigger a reconnect (except
+    // 429, always retried) — retrying an identical request usually just repeats the same failure.
+    // Set true to retry every HTTP error, including 4xx.
+    var retryOnClientError = false
+
+    // Default "GET". "POST" (with `body`) is for SSE APIs that stream the response to a request
+    // body, e.g. most LLM chat-completion endpoints.
+    var method: String? = null
+    var body: String? = null
+    // Default true — a 2xx response whose Content-Type isn't text/event-stream is reported via
+    // onError ('invalid-content-type') instead of being treated as an open stream.
+    var validateContentType = true
   }
 
   private val streams = mutableMapOf<String, StreamState>()
@@ -214,6 +229,11 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     state.reconnectEnabled = if (reconnectOptions?.hasKey("enabled") == true) reconnectOptions.getBoolean("enabled") else true
     state.reconnectIntervalMs = if (reconnectOptions?.hasKey("intervalMs") == true) reconnectOptions.getDouble("intervalMs") else DEFAULT_RECONNECT_INTERVAL_MS
     state.reconnectMaxAttempts = if (reconnectOptions?.hasKey("maxAttempts") == true) reconnectOptions.getDouble("maxAttempts") else null
+    state.retryOnClientError = reconnectOptions?.hasKey("retryOnClientError") == true && reconnectOptions.getBoolean("retryOnClientError")
+
+    state.method = if (options?.hasKey("method") == true) options.getString("method") else null
+    state.body = if (options?.hasKey("body") == true) options.getString("body") else null
+    state.validateContentType = if (options?.hasKey("validateContentType") == true) options.getBoolean("validateContentType") else true
 
     streams[streamId] = state
     // `options` (session config) is only ever consulted on the very first connect() made across
@@ -239,6 +259,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
       .tag(ConnectionAttempt::class.java, ConnectionAttempt(streamId, generation))
 
     state.headers?.forEach { (key, value) -> requestBuilder.header(key, value) }
+    applyMethodAndBody(requestBuilder, state.method, state.body)
 
     // Only sent on an automatic reconnect that has actually seen an id: field — an explicit
     // connect() always starts a fresh logical session (lastEventId is unset on a fresh StreamState).
@@ -275,8 +296,30 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
             }
           )
           emitEvent("onClose", Arguments.createMap().apply { putString("streamId", streamId) })
-          scheduleReconnectIfNeeded(streamId)
+          scheduleReconnectIfNeeded(streamId, httpStatus = statusCode)
           return
+        }
+
+        val shouldValidateContentType = streams[streamId]?.validateContentType ?: true
+        if (shouldValidateContentType) {
+          val contentType = response.header("Content-Type")?.lowercase() ?: ""
+          if (!contentType.startsWith("text/event-stream")) {
+            val bodyString = readBoundedBody(response)
+            response.close()
+            val message = bodyString.ifEmpty { "Response Content-Type was not text/event-stream" }
+            Log.e(LOG_TAG, "[$streamId] invalid content-type")
+            emitEvent(
+              "onError",
+              Arguments.createMap().apply {
+                putString("streamId", streamId)
+                putString("message", message)
+                putString("type", "invalid-content-type")
+              }
+            )
+            emitEvent("onClose", Arguments.createMap().apply { putString("streamId", streamId) })
+            scheduleReconnectIfNeeded(streamId, wasContentTypeError = true)
+            return
+          }
         }
 
         streams[streamId]?.reconnectAttempts = 0
@@ -354,6 +397,15 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     })
   }
 
+  private fun applyMethodAndBody(builder: Request.Builder, method: String?, body: String?) {
+    val resolvedMethod = method?.uppercase() ?: "GET"
+    if (resolvedMethod !in METHODS_REQUIRING_BODY && body == null) {
+      builder.method(resolvedMethod, null)
+      return
+    }
+    builder.method(resolvedMethod, (body ?: "").toRequestBody())
+  }
+
   private fun readBoundedBody(response: Response): String {
     val source = response.body?.source() ?: return ""
     return try {
@@ -368,12 +420,26 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     }
   }
 
+  // By default, a 4xx response or a Content-Type mismatch doesn't warrant a reconnect — retrying
+  // an identical request usually just repeats the same failure. 429 is the one exception (always
+  // retried), and retryOnClientError overrides this entirely. 5xx/network/timeout errors (no
+  // httpStatus, not a content-type error) are always retryable here.
+  private fun isRetryableByDefault(streamId: String, httpStatus: Int?, wasContentTypeError: Boolean): Boolean {
+    val state = streams[streamId] ?: return true
+    if (state.retryOnClientError) return true
+    if (wasContentTypeError) return false
+    if (httpStatus == null) return true
+    if (httpStatus == 429) return true
+    return httpStatus !in 400..499
+  }
+
   // Presence of `streams[streamId]` is what distinguishes "still an active stream, just between
   // connections" from "disconnect() was called" — disconnect() removes the entry entirely, so a
   // stale reconnect Runnable finds nothing here and no-ops.
-  private fun scheduleReconnectIfNeeded(streamId: String) {
+  private fun scheduleReconnectIfNeeded(streamId: String, httpStatus: Int? = null, wasContentTypeError: Boolean = false) {
     val state = streams[streamId] ?: return
     if (!state.reconnectEnabled) return
+    if (!isRetryableByDefault(streamId, httpStatus, wasContentTypeError)) return
     state.reconnectMaxAttempts?.let { max -> if (state.reconnectAttempts >= max) return }
     state.reconnectAttempts += 1
 

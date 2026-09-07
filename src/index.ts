@@ -17,13 +17,21 @@ export interface SSEMessageEvent {
 /**
  * 'http': the server responded, but with a non-2xx status — `statusCode` and `message` (the
  * response body, if any) are populated.
+ * 'invalid-content-type': the server responded 2xx, but with a Content-Type other than
+ * `text/event-stream` — usually a misconfigured server/proxy (a login redirect page, a JSON
+ * error body dressed up as 200, etc). `message` describes what was received.
  * 'timeout': the request's own timeout (SSESessionOptions.timeoutSeconds) elapsed with no
  * response.
  * 'network': a transport-level failure (DNS, connection refused, TLS, dropped connection, etc.)
  * — `message` is the OS's own error description.
  * 'exception': the call couldn't even be attempted (e.g. an invalid URL).
  */
-export type SSEErrorType = 'http' | 'network' | 'timeout' | 'exception';
+export type SSEErrorType =
+  | 'http'
+  | 'invalid-content-type'
+  | 'network'
+  | 'timeout'
+  | 'exception';
 
 export interface SSEError {
   message: string;
@@ -62,6 +70,15 @@ export interface SSEReconnectOptions {
    * forever). Resets to 0 after any successful onOpen.
    */
   maxAttempts?: number;
+  /**
+   * By default, a 4xx response (client error) or a Content-Type mismatch does NOT trigger a
+   * reconnect — that class of failure reflects something wrong with the request/server config
+   * that retrying identically won't fix. The one exception retried by default regardless is 429
+   * (rate limited — a deliberate "back off and try again" signal). 5xx, network, and timeout
+   * errors always retry (subject to maxAttempts). Set true to retry every HTTP error, including
+   * 4xx.
+   */
+  retryOnClientError?: boolean;
 }
 
 /**
@@ -92,6 +109,16 @@ export interface SSEStreamOptions {
   /** Automatic reconnect after the connection ends (error, or the server closing the stream).
    * On by default — see SSEReconnectOptions. */
   reconnect?: SSEReconnectOptions;
+  /** Default 'GET'. Use 'POST' (with `body`) for APIs that stream SSE responses to a request
+   * body — e.g. most LLM chat-completion endpoints. */
+  method?: string;
+  /** Sent as the raw request body (e.g. `JSON.stringify(...)`). Set your own `Content-Type` via
+   * `headers` — none is assumed. */
+  body?: string;
+  /** Default true. A non-`text/event-stream` Content-Type on an otherwise-successful response is
+   * reported via onError (type 'invalid-content-type') instead of being treated as open. Set
+   * false for a server that's valid SSE but sends a different/no Content-Type. */
+  validateContentType?: boolean;
 }
 
 type Unsubscribe = () => void;
