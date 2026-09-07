@@ -13,6 +13,7 @@
 //
 
 import Foundation
+import Network
 import React
 
 private let defaultReconnectIntervalMs: Double = 3000
@@ -26,12 +27,14 @@ private let maxErrorBodyBytes = 8192
 /// 'connecting': an explicit connect() call's first attempt is in flight.
 /// 'open': the connection is live, after onOpen.
 /// 'reconnecting': an automatic retry is pending (waiting out the backoff delay) or in flight.
+/// 'paused': reconnecting is on hold because the device currently has no network connectivity —
+/// see StreamState.monitorNetworkEnabled. Resumes automatically the instant connectivity returns.
 /// 'closed': ended intentionally — disconnect(), or the connection ended while
 /// reconnect.enabled was false.
 /// 'failed': automatic reconnect gave up — a non-retryable error, or reconnect.maxAttempts was
 /// reached. A fresh connect() is needed to try again.
 private enum ConnectionState: String {
-  case idle, connecting, open, reconnecting, closed, failed
+  case idle, connecting, open, reconnecting, paused, closed, failed
 }
 
 private struct StreamState {
@@ -109,6 +112,18 @@ private struct StreamState {
   var awaitingBeforeRequestId: Int?
   var pendingBeforeRequestIsReconnect = false
   var pendingBeforeRequestTimeout: DispatchWorkItem?
+
+  // Network-aware pause/resume (SSEReconnectOptions.monitorNetwork). One NWPathMonitor per
+  // stream, started on the first connect() and torn down on disconnect() — simpler and safer
+  // than a shared/broadcast monitor across every stream, at the cost of one lightweight monitor
+  // per concurrent stream (never many in practice).
+  var networkMonitor: NWPathMonitor?
+  var monitorNetworkEnabled = true
+  // nil until the monitor's first path update establishes a baseline — that first callback is
+  // ignored for triggering pause/resume (only later *changes* from the baseline do), so a monitor
+  // that happens to start while already offline doesn't immediately pause a connect() that hasn't
+  // even been attempted yet.
+  var hasNetworkConnectivity: Bool?
 }
 
 // If JS never calls provideRequestHeaders() back (a broken onBeforeRequest hook that never
@@ -185,6 +200,7 @@ class SSEBridgeClient: RCTEventEmitter {
 
     streams[streamId]?.pendingReconnect?.cancel()
     streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
+    streams[streamId]?.networkMonitor?.cancel()
     endTask(for: streamId)
 
     var state = StreamState()
@@ -210,14 +226,81 @@ class SSEBridgeClient: RCTEventEmitter {
 
     state.hasBeforeRequestListener = (options["hasBeforeRequestListener"] as? NSNumber)?.boolValue ?? false
 
+    state.monitorNetworkEnabled = (reconnectOptions?["monitorNetwork"] as? NSNumber)?.boolValue ?? true
+
     streams[streamId] = state
     // `options` (session config) is only ever consulted on the very first connect() made across
     // ALL streams — see sharedSession(options:) — so it's fine that reconnects (which call
     // performConnect directly, not through here) don't have it to hand.
     _ = sharedSession(options: options)
 
+    startNetworkMonitoringIfNeeded(streamId: streamId)
     setState(streamId: streamId, .connecting)
     performConnect(streamId: streamId, isReconnect: false)
+  }
+
+  // Only actually starts anything when network-aware pause/resume is meaningful: monitoring is
+  // pointless if reconnectEnabled is false (there's no automatic reconnection to protect). A
+  // no-op if a monitor from an earlier connect() on this stream is already running.
+  private func startNetworkMonitoringIfNeeded(streamId: String) {
+    guard let state = streams[streamId], state.monitorNetworkEnabled, state.reconnectEnabled,
+          state.networkMonitor == nil else { return }
+    let monitor = NWPathMonitor()
+    monitor.pathUpdateHandler = { [weak self] path in
+      guard let self else { return }
+      let connected = path.status == .satisfied
+      let previous = self.streams[streamId]?.hasNetworkConnectivity
+      self.streams[streamId]?.hasNetworkConnectivity = connected
+      // Ignore the initial baseline callback — reacting to it caused exactly this kind of bug in
+      // the library we borrowed this feature's design from (an immediate, spurious restart from
+      // NWPathMonitor's first status report racing with the stream's own first connect attempt).
+      guard let previous, previous != connected else { return }
+      if connected {
+        self.handleNetworkRestored(streamId: streamId)
+      } else {
+        self.handleNetworkLost(streamId: streamId)
+      }
+    }
+    monitor.start(queue: DispatchQueue(label: "com.ssebridgeclient.networkmonitor"))
+    streams[streamId]?.networkMonitor = monitor
+  }
+
+  private func stopNetworkMonitoring(streamId: String) {
+    streams[streamId]?.networkMonitor?.cancel()
+    streams[streamId]?.networkMonitor = nil
+    streams[streamId]?.hasNetworkConnectivity = nil
+  }
+
+  // Proactively tears down whatever's currently happening (an open connection, or a reconnect
+  // already in flight/pending) and pauses, rather than waiting for the OS to eventually notice
+  // the dead network via a timeout.
+  private func handleNetworkLost(streamId: String) {
+    guard let state = streams[streamId], state.monitorNetworkEnabled,
+          state.currentState != .paused else { return }
+    streams[streamId]?.pendingReconnect?.cancel()
+    streams[streamId]?.pendingReconnect = nil
+    // Invalidates any attempt still in its onBeforeRequest await (i.e. connecting/reconnecting
+    // but with no task yet) — without this, that attempt's guard back in performConnect would
+    // still pass and it would go on to fire a request moments after we've just paused.
+    streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
+    streams[streamId]?.pendingBeforeRequestTimeout = nil
+    streams[streamId]?.awaitingBeforeRequestId = nil
+    let hadActiveTask = streams[streamId]?.task != nil
+    endTask(for: streamId)
+    streams[streamId]?.task = nil
+    setState(streamId: streamId, .paused)
+    if hadActiveTask, hasListeners {
+      sendEvent(withName: "onClose", body: ["streamId": streamId])
+    }
+  }
+
+  // Reconnects immediately (no backoff delay) with a fresh attempt budget — a real connectivity
+  // restoration is a strong positive signal, distinct from a repeated failure of the same kind.
+  private func handleNetworkRestored(streamId: String) {
+    guard let state = streams[streamId], state.monitorNetworkEnabled,
+          state.currentState == .paused else { return }
+    streams[streamId]?.reconnectAttempts = 0
+    performConnect(streamId: streamId, isReconnect: true)
   }
 
   // Only fires onStateChange when the state actually changes — callers can transition through
@@ -336,6 +419,7 @@ class SSEBridgeClient: RCTEventEmitter {
     streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
     let hadActiveTask = streams[streamId]?.task != nil
     endTask(for: streamId)
+    stopNetworkMonitoring(streamId: streamId)
     setState(streamId: streamId, .closed)
     streams[streamId] = nil
     if hadActiveTask, hasListeners {
@@ -519,6 +603,15 @@ class SSEBridgeClient: RCTEventEmitter {
     }
     if let maxAttempts = state.reconnectMaxAttempts, Double(state.reconnectAttempts) >= maxAttempts {
       setState(streamId: streamId, .failed)
+      return
+    }
+    // No point starting a backoff timer into a network that's currently down — pause and let
+    // handleNetworkRestored() reconnect immediately once it's back. hasNetworkConnectivity being
+    // nil (no baseline established yet) is treated as "assume connected", same as monitoring
+    // being disabled — this path only ever downgrades an attempt we'd otherwise make, never
+    // blocks one outright.
+    if state.monitorNetworkEnabled, state.hasNetworkConnectivity == false {
+      setState(streamId: streamId, .paused)
       return
     }
 

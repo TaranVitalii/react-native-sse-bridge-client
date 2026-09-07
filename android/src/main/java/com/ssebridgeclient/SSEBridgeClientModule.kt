@@ -1,5 +1,8 @@
 package com.ssebridgeclient
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -49,6 +52,8 @@ private const val BEFORE_REQUEST_TIMEOUT_MS = 10_000L
  * 'connecting': an explicit connect() call's first attempt is in flight.
  * 'open': the connection is live, after onOpen.
  * 'reconnecting': an automatic retry is pending (waiting out the backoff delay) or in flight.
+ * 'paused': reconnecting is on hold because the device currently has no network connectivity —
+ * see StreamState.monitorNetworkEnabled. Resumes automatically the instant connectivity returns.
  * 'closed': ended intentionally — disconnect(), or the connection ended while
  * reconnect.enabled was false.
  * 'failed': automatic reconnect gave up — a non-retryable error, or reconnect.maxAttempts was
@@ -59,6 +64,7 @@ private enum class ConnectionState(val value: String) {
   CONNECTING("connecting"),
   OPEN("open"),
   RECONNECTING("reconnecting"),
+  PAUSED("paused"),
   CLOSED("closed"),
   FAILED("failed"),
 }
@@ -152,6 +158,18 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     var awaitingBeforeRequestId: Int? = null
     var pendingBeforeRequestIsReconnect = false
     var pendingBeforeRequestTimeout: Runnable? = null
+
+    // Network-aware pause/resume (SSEReconnectOptions.monitorNetwork). One NetworkCallback per
+    // stream, registered on the first connect() and unregistered on disconnect() — simpler and
+    // safer than a shared/broadcast callback across every stream, at the cost of one lightweight
+    // callback per concurrent stream (never many in practice).
+    var networkCallback: ConnectivityManager.NetworkCallback? = null
+    var monitorNetworkEnabled = true
+    // null until the callback's first event establishes a baseline — that first callback is
+    // ignored for triggering pause/resume (only later *changes* from the baseline do), so a
+    // callback that happens to fire while already offline doesn't immediately pause a connect()
+    // that hasn't even been attempted yet.
+    var hasNetworkConnectivity: Boolean? = null
   }
 
   private val streams = mutableMapOf<String, StreamState>()
@@ -254,6 +272,11 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     }
 
     streams[streamId]?.pendingReconnect?.let { mainHandler.removeCallbacks(it) }
+    // Harmless without this (a stale Runnable's requestId can never match a fresh StreamState's
+    // awaitingBeforeRequestId, since nextBeforeRequestId never resets), but cancelling it is
+    // still tidier than leaving a dead Runnable sitting in the Handler's queue.
+    streams[streamId]?.pendingBeforeRequestTimeout?.let { mainHandler.removeCallbacks(it) }
+    stopNetworkMonitoring(streamId)
     streams[streamId]?.currentCall?.let { emitCloseMetrics(streamId, it) }
     streams[streamId]?.currentCall?.cancel()
 
@@ -290,14 +313,104 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     state.hasBeforeRequestListener = options?.hasKey("hasBeforeRequestListener") == true &&
       options.getBoolean("hasBeforeRequestListener")
 
+    state.monitorNetworkEnabled = if (reconnectOptions?.hasKey("monitorNetwork") == true) {
+      reconnectOptions.getBoolean("monitorNetwork")
+    } else {
+      true
+    }
+
     streams[streamId] = state
     // `options` (session config) is only ever consulted on the very first connect() made across
     // ALL streams — see sharedClient(options:) — so it's fine that reconnects (which call
     // performConnect directly, not through here) don't have it to hand.
     sharedClient(options)
 
+    startNetworkMonitoringIfNeeded(streamId)
     setState(streamId, ConnectionState.CONNECTING)
     performConnect(streamId, isReconnect = false)
+  }
+
+  // Only actually registers anything when network-aware pause/resume is meaningful: monitoring
+  // is pointless if reconnectEnabled is false (there's no automatic reconnection to protect). A
+  // no-op if a callback from an earlier connect() on this stream is already registered.
+  private fun startNetworkMonitoringIfNeeded(streamId: String) {
+    val state = streams[streamId] ?: return
+    if (!state.monitorNetworkEnabled || !state.reconnectEnabled || state.networkCallback != null) return
+    val connectivityManager = reactApplicationContext
+      .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+      ?: return
+
+    val callback = object : ConnectivityManager.NetworkCallback() {
+      override fun onAvailable(network: Network) = updateConnectivity(streamId, true)
+      // registerDefaultNetworkCallback's onLost only fires once there's no default network at
+      // all (a transport switch, e.g. WiFi -> cellular, fires onAvailable for the new default
+      // instead) — so this already means "no connectivity", no extra check needed.
+      override fun onLost(network: Network) = updateConnectivity(streamId, false)
+    }
+    try {
+      connectivityManager.registerDefaultNetworkCallback(callback)
+      state.networkCallback = callback
+    } catch (e: Exception) {
+      Log.e(LOG_TAG, "[$streamId] failed to register network callback", e)
+    }
+  }
+
+  private fun updateConnectivity(streamId: String, connected: Boolean) {
+    val state = streams[streamId] ?: return
+    val previous = state.hasNetworkConnectivity
+    state.hasNetworkConnectivity = connected
+    // Ignore the initial baseline callback — reacting to it caused exactly this kind of bug in
+    // the library we borrowed this feature's design from (an immediate, spurious restart from
+    // the first status report racing with the stream's own first connect attempt).
+    if (previous == null || previous == connected) return
+    if (connected) handleNetworkRestored(streamId) else handleNetworkLost(streamId)
+  }
+
+  private fun stopNetworkMonitoring(streamId: String) {
+    val state = streams[streamId] ?: return
+    val callback = state.networkCallback ?: return
+    state.networkCallback = null
+    state.hasNetworkConnectivity = null
+    val connectivityManager = reactApplicationContext
+      .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+    try {
+      connectivityManager.unregisterNetworkCallback(callback)
+    } catch (e: Exception) {
+      // Already unregistered, or never fully registered — nothing to clean up.
+    }
+  }
+
+  // Proactively tears down whatever's currently happening (an open connection, or a reconnect
+  // already in flight/pending) and pauses, rather than waiting for OkHttp/the OS to eventually
+  // notice the dead network via a timeout.
+  private fun handleNetworkLost(streamId: String) {
+    val state = streams[streamId] ?: return
+    if (!state.monitorNetworkEnabled || state.currentState == ConnectionState.PAUSED) return
+    state.pendingReconnect?.let { mainHandler.removeCallbacks(it) }
+    state.pendingReconnect = null
+    // Invalidates any attempt still in its onBeforeRequest await (i.e. connecting/reconnecting
+    // but with no call yet) — without this, that attempt's guard back in performConnect would
+    // still pass and it would go on to fire a request moments after we've just paused.
+    state.pendingBeforeRequestTimeout?.let { mainHandler.removeCallbacks(it) }
+    state.pendingBeforeRequestTimeout = null
+    state.awaitingBeforeRequestId = null
+    state.currentCall?.let { emitCloseMetrics(streamId, it) }
+    val hadActiveCall = state.currentCall != null
+    state.currentCall?.cancel()
+    state.currentCall = null
+    setState(streamId, ConnectionState.PAUSED)
+    if (hadActiveCall) {
+      emitEvent("onClose", Arguments.createMap().apply { putString("streamId", streamId) })
+    }
+  }
+
+  // Reconnects immediately (no backoff delay) with a fresh attempt budget — a real connectivity
+  // restoration is a strong positive signal, distinct from a repeated failure of the same kind.
+  private fun handleNetworkRestored(streamId: String) {
+    val state = streams[streamId] ?: return
+    if (!state.monitorNetworkEnabled || state.currentState != ConnectionState.PAUSED) return
+    state.reconnectAttempts = 0
+    performConnect(streamId, isReconnect = true)
   }
 
   // Only fires onStateChange when the state actually changes — callers can transition through
@@ -596,6 +709,15 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
         return
       }
     }
+    // No point starting a backoff timer into a network that's currently down — pause and let
+    // handleNetworkRestored() reconnect immediately once it's back. hasNetworkConnectivity being
+    // null (no baseline established yet) is treated as "assume connected", same as monitoring
+    // being disabled — this path only ever downgrades an attempt we'd otherwise make, never
+    // blocks one outright.
+    if (state.monitorNetworkEnabled && state.hasNetworkConnectivity == false) {
+      setState(streamId, ConnectionState.PAUSED)
+      return
+    }
 
     val delayMs = nextReconnectDelayMs(state, state.reconnectAttempts)
     state.reconnectAttempts += 1
@@ -626,6 +748,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     val state = streams[streamId] ?: return
     state.pendingReconnect?.let { mainHandler.removeCallbacks(it) }
     state.pendingBeforeRequestTimeout?.let { mainHandler.removeCallbacks(it) }
+    stopNetworkMonitoring(streamId)
     state.currentCall?.let { emitCloseMetrics(streamId, it) }
     val hadActiveCall = state.currentCall != null
     state.currentCall?.cancel()

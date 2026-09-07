@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Network-aware pause/resume (SSEReconnectOptions.monitorNetwork) uses
+         ConnectivityManager.registerDefaultNetworkCallback, which requires this permission. Most
+         React Native apps already declare it via other dependencies; merged into the host app's
+         manifest automatically if not. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+</manifest>
