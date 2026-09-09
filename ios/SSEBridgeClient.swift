@@ -52,11 +52,25 @@ private struct StreamState {
   var reconnectAttempts = 0
   var pendingReconnect: DispatchWorkItem?
   var lastEventId: String?
+  // By default, a 4xx response or a Content-Type mismatch does NOT trigger a reconnect (except
+  // 429, always retried) — retrying an identical request usually just repeats the same failure.
+  // Set true to retry every HTTP error, including 4xx.
+  var retryOnClientError = false
 
-  // Set when the response status isn't 2xx; handleData then buffers the body here (instead of
-  // feeding it through the normal SSE byteBuffer/parser) so it can be reported as the onError
-  // message once the response completes.
+  // Default 'GET'. 'POST' (with `body`) is for SSE APIs that stream the response to a request
+  // body, e.g. most LLM chat-completion endpoints.
+  var method: String?
+  var body: String?
+  // Default true — a 2xx response whose Content-Type isn't text/event-stream is reported via
+  // onError ('invalid-content-type') instead of being treated as an open stream.
+  var validateContentType = true
+
+  // Set when the response status isn't 2xx, or (when validateContentType) the Content-Type
+  // doesn't match; handleData then buffers the body here (instead of feeding it through the
+  // normal SSE byteBuffer/parser) so it can be reported as the onError message once the response
+  // completes.
   var errorStatusCode: Int?
+  var contentTypeError = false
   var errorBodyData = Data()
 }
 
@@ -141,6 +155,11 @@ class SSEBridgeClient: RCTEventEmitter {
     state.reconnectEnabled = (reconnectOptions?["enabled"] as? NSNumber)?.boolValue ?? true
     state.reconnectIntervalMs = (reconnectOptions?["intervalMs"] as? NSNumber)?.doubleValue ?? defaultReconnectIntervalMs
     state.reconnectMaxAttempts = (reconnectOptions?["maxAttempts"] as? NSNumber)?.doubleValue
+    state.retryOnClientError = (reconnectOptions?["retryOnClientError"] as? NSNumber)?.boolValue ?? false
+
+    state.method = options["method"] as? String
+    state.body = options["body"] as? String
+    state.validateContentType = (options["validateContentType"] as? NSNumber)?.boolValue ?? true
 
     streams[streamId] = state
     // `options` (session config) is only ever consulted on the very first connect() made across
@@ -156,11 +175,16 @@ class SSEBridgeClient: RCTEventEmitter {
 
     streams[streamId]?.byteBuffer.removeAll(keepingCapacity: false)
     streams[streamId]?.errorStatusCode = nil
+    streams[streamId]?.contentTypeError = false
     streams[streamId]?.errorBodyData.removeAll(keepingCapacity: false)
     streams[streamId]?.firstByteLogged = false
     streams[streamId]?.connectStartedAt = Date()
 
     var request = URLRequest(url: connectURL)
+    request.httpMethod = streams[streamId]?.method ?? "GET"
+    if let bodyString = streams[streamId]?.body {
+      request.httpBody = bodyString.data(using: .utf8)
+    }
     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
     if let headers = streams[streamId]?.headers {
       for (key, value) in headers {
@@ -219,15 +243,33 @@ class SSEBridgeClient: RCTEventEmitter {
     // response like this would fire onOpen() for a connection that's no longer the active one.
     guard streams[streamId]?.task?.taskIdentifier == taskId else { return }
 
-    guard let httpResponse = response as? HTTPURLResponse, !(200..<300).contains(httpResponse.statusCode) else {
+    guard let httpResponse = response as? HTTPURLResponse else {
       streams[streamId]?.reconnectAttempts = 0
       guard hasListeners else { return }
       sendEvent(withName: "onOpen", body: ["streamId": streamId])
       return
     }
-    // Non-2xx: don't fire onOpen at all — handleData buffers the error body instead of treating
-    // it as SSE frames, and handleCompletion reports it once the response finishes.
-    streams[streamId]?.errorStatusCode = httpResponse.statusCode
+
+    guard (200..<300).contains(httpResponse.statusCode) else {
+      // Non-2xx: don't fire onOpen at all — handleData buffers the error body instead of treating
+      // it as SSE frames, and handleCompletion reports it once the response finishes.
+      streams[streamId]?.errorStatusCode = httpResponse.statusCode
+      return
+    }
+
+    if streams[streamId]?.validateContentType == true {
+      let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+      guard contentType.hasPrefix("text/event-stream") else {
+        // Same idea as the non-2xx branch above: buffer the body instead of parsing it as SSE,
+        // and report it once the response finishes.
+        streams[streamId]?.contentTypeError = true
+        return
+      }
+    }
+
+    streams[streamId]?.reconnectAttempts = 0
+    guard hasListeners else { return }
+    sendEvent(withName: "onOpen", body: ["streamId": streamId])
   }
 
   fileprivate func handleData(taskId: Int, data: Data) {
@@ -237,7 +279,7 @@ class SSEBridgeClient: RCTEventEmitter {
     // new connection's (already-reset) byteBuffer.
     guard streams[streamId]?.task?.taskIdentifier == taskId else { return }
 
-    if streams[streamId]?.errorStatusCode != nil {
+    if streams[streamId]?.errorStatusCode != nil || streams[streamId]?.contentTypeError == true {
       let currentSize = streams[streamId]?.errorBodyData.count ?? 0
       let remaining = maxErrorBodyBytes - currentSize
       if remaining > 0 {
@@ -283,7 +325,24 @@ class SSEBridgeClient: RCTEventEmitter {
         ])
         sendEvent(withName: "onClose", body: ["streamId": streamId])
       }
-      scheduleReconnectIfNeeded(streamId: streamId)
+      scheduleReconnectIfNeeded(streamId: streamId, httpStatus: statusCode)
+      return
+    }
+
+    if streams[streamId]?.contentTypeError == true {
+      let bodyData = streams[streamId]?.errorBodyData ?? Data()
+      let bodyString = String(data: bodyData, encoding: .utf8) ?? ""
+      let message = bodyString.isEmpty ? "Response Content-Type was not text/event-stream" : bodyString
+      streams[streamId]?.contentTypeError = false
+      streams[streamId]?.errorBodyData = Data()
+      NSLog("[Bridge SSE][iOS][%@] invalid content-type", streamId)
+      if hasListeners {
+        sendEvent(withName: "onError", body: [
+          "streamId": streamId, "message": message, "type": "invalid-content-type",
+        ])
+        sendEvent(withName: "onClose", body: ["streamId": streamId])
+      }
+      scheduleReconnectIfNeeded(streamId: streamId, wasContentTypeError: true)
       return
     }
 
@@ -308,11 +367,25 @@ class SSEBridgeClient: RCTEventEmitter {
     scheduleReconnectIfNeeded(streamId: streamId)
   }
 
+  // By default, a 4xx response or a Content-Type mismatch doesn't warrant a reconnect — retrying
+  // an identical request usually just repeats the same failure. 429 is the one exception (always
+  // retried), and retryOnClientError overrides this entirely. 5xx/network/timeout errors (no
+  // httpStatus, not a content-type error) are always retryable here.
+  private func isRetryableByDefault(streamId: String, httpStatus: Int?, wasContentTypeError: Bool) -> Bool {
+    guard let state = streams[streamId] else { return true }
+    if state.retryOnClientError { return true }
+    if wasContentTypeError { return false }
+    guard let httpStatus else { return true }
+    if httpStatus == 429 { return true }
+    return !(400..<500).contains(httpStatus)
+  }
+
   // Presence of `streams[streamId]` is what distinguishes "still an active stream, just between
   // connections" from "disconnect() was called" — disconnect() removes the entry entirely, so a
   // stale reconnect timer's closure finds nothing here and no-ops.
-  private func scheduleReconnectIfNeeded(streamId: String) {
+  private func scheduleReconnectIfNeeded(streamId: String, httpStatus: Int? = nil, wasContentTypeError: Bool = false) {
     guard var state = streams[streamId], state.reconnectEnabled else { return }
+    guard isRetryableByDefault(streamId: streamId, httpStatus: httpStatus, wasContentTypeError: wasContentTypeError) else { return }
     if let maxAttempts = state.reconnectMaxAttempts, Double(state.reconnectAttempts) >= maxAttempts { return }
     state.reconnectAttempts += 1
     streams[streamId] = state

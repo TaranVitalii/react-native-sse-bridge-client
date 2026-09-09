@@ -58,6 +58,22 @@ stream.disconnect()
 stream.destroy()
 ```
 
+### POST requests
+
+Some SSE APIs — most LLM chat-completion endpoints included — stream the response to a `POST`
+whose body carries the request payload, rather than a plain `GET`. Pass `method`/`body`:
+
+```ts
+stream.connect('https://your-server.example.com/chat/completions', {
+  method: 'POST',
+  headers: {
+    Authorization: 'Bearer …',
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ model: 'your-model', messages, stream: true }),
+})
+```
+
 ## API
 
 ### `createSSEStream(): SSEStream`
@@ -72,11 +88,11 @@ Sets the shared session config (timeout, max connections per host) once, up fron
 
 | Method | Description |
 | --- | --- |
-| `connect(url: string, options?: SSEStreamOptions): void` | Opens a connection to `url`. Calling this again on the same stream cancels the previous connection first (its close metrics still fire). Headers — including `User-Agent` — are entirely JS-configured; nothing is hardcoded natively. |
+| `connect(url: string, options?: SSEStreamOptions): void` | Opens a connection to `url`, `GET` by default — pass `options.method`/`options.body` for a POST-based SSE API (most LLM chat-completion endpoints). Calling this again on the same stream cancels the previous connection first (its close metrics still fire). Headers — including `User-Agent` — are entirely JS-configured; nothing is hardcoded natively. |
 | `disconnect(): void` | Closes the current connection, if any. |
 | `addEventListener(type: string, callback: (event: SSEMessageEvent) => void): () => void` | Subscribes to a specific SSE `event:` type, mirroring the browser `EventSource` model — frames with no `event:` field (or `event: message`) are filed under `'message'`. Returns an unsubscribe function. |
 | `onOpen(callback: () => void): () => void` | Fires when the server responds with a successful (2xx) status. |
-| `onError(callback: (error: SSEError) => void): () => void` | Fires on a non-2xx HTTP response, a network/transport failure, a timeout, or an invalid URL — see [Types](#types) below for `SSEError`. Not called for a `disconnect()` you initiated yourself. |
+| `onError(callback: (error: SSEError) => void): () => void` | Fires on a non-2xx HTTP response, a Content-Type mismatch (unless `validateContentType: false`), a network/transport failure, a timeout, or an invalid URL — see [Types](#types) below for `SSEError`. Not called for a `disconnect()` you initiated yourself. |
 | `onClose(callback: () => void): () => void` | Fires whenever the connection ends, for any reason — a normal server-side close, right after `onError`, or an explicit `disconnect()`. Fires again after every automatic reconnect's connection ends, so it does not mean the stream gave up. |
 | `onMetrics(callback: (metrics: SSEConnectionMetrics) => void): () => void` | Fires once per connection, when it ends — see below. Like `addEventListener`, whether this has any listener is pushed down natively; with none, the event is dropped before it crosses the bridge. |
 | `destroy(): void` | Disconnects, drops every listener, and unsubscribes from the shared native event emitter. Call this when you're done with the stream (e.g. on unmount). |
@@ -99,10 +115,12 @@ interface SSEConnectionMetrics {
 }
 
 // 'http': non-2xx response — statusCode and message (the response body) are populated.
+// 'invalid-content-type': a 2xx response whose Content-Type wasn't text/event-stream (only
+// reported when validateContentType is true, the default) — message describes what was received.
 // 'timeout': the request's own timeout (SSESessionOptions.timeoutSeconds) elapsed.
 // 'network': a transport-level failure (DNS, connection refused, TLS, dropped connection, etc.).
 // 'exception': the call couldn't even be attempted (e.g. an invalid URL).
-type SSEErrorType = 'http' | 'network' | 'timeout' | 'exception'
+type SSEErrorType = 'http' | 'invalid-content-type' | 'network' | 'timeout' | 'exception'
 
 interface SSEError {
   message: string
@@ -114,6 +132,9 @@ interface SSEStreamOptions {
   headers?: Record<string, string>
   session?: SSESessionOptions
   reconnect?: SSEReconnectOptions
+  method?: string // default 'GET'; use 'POST' (with `body`) for APIs that stream to a request body
+  body?: string // raw request body (e.g. JSON.stringify(...)); set Content-Type via `headers`
+  validateContentType?: boolean // default true — see SSEErrorType 'invalid-content-type' above
 }
 
 interface SSESessionOptions {
@@ -125,6 +146,10 @@ interface SSEReconnectOptions {
   enabled?: boolean // default true
   intervalMs?: number // default 3000; overridden per-stream by a server `retry:` field
   maxAttempts?: number // default undefined (retry forever); resets to 0 after a successful onOpen
+  // Default false. A 4xx response or a Content-Type mismatch does NOT trigger a reconnect by
+  // default (except 429, which always retries) — that class of failure usually means retrying
+  // identically won't help. Set true to retry every HTTP error, including 4xx.
+  retryOnClientError?: boolean
 }
 ```
 
@@ -175,6 +200,7 @@ Reconnecting is automatic by default, mirroring the browser `EventSource` model 
 - **Delay**: starts at `reconnect.intervalMs` (default `3000`). A `retry:` field in the stream overrides it for that stream's *next* reconnects — there's no exponential backoff on top of that, matching `react-native-sse`'s behavior.
 - **`Last-Event-ID`**: if any received event had an `id:` field, it's sent as the `Last-Event-ID` header on the next automatic reconnect, so a server that supports it can resume from where it left off. An explicit `connect()` call always starts a fresh logical session — it does not send a stale `Last-Event-ID` from before.
 - **Giving up**: set `reconnect.maxAttempts` to stop retrying after that many consecutive failures (default: retry forever). The counter resets to 0 after any successful `onOpen`.
+- **Client errors**: a 4xx response or a Content-Type mismatch (see `validateContentType`) does **not** trigger a reconnect by default — retrying an identical request against a 401/403/404/etc. usually just repeats the same failure. The one default exception is `429` (rate limited), which always retries. Set `reconnect.retryOnClientError: true` to retry every HTTP error, including 4xx. 5xx, network, and timeout errors always retry (subject to `maxAttempts`), regardless of this setting.
 - **Opting out**: `stream.connect(url, { reconnect: { enabled: false } })` disables it entirely — call `connect()` yourself (e.g. from `onError`/`onClose`) to drive reconnection your own way.
 
 ```ts
