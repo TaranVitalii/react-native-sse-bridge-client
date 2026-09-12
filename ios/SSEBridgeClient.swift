@@ -16,9 +16,23 @@ import Foundation
 import React
 
 private let defaultReconnectIntervalMs: Double = 3000
+private let defaultMaxReconnectIntervalMs: Double = 30000
+private let defaultJitterFactor: Double = 0.5
 // Error responses (4xx/5xx) are typically small JSON/HTML bodies — bounded so a misbehaving
 // server streaming an enormous error page can't grow this unboundedly before completion.
 private let maxErrorBodyBytes = 8192
+
+/// 'idle': never connected, or destroy()ed — the initial state.
+/// 'connecting': an explicit connect() call's first attempt is in flight.
+/// 'open': the connection is live, after onOpen.
+/// 'reconnecting': an automatic retry is pending (waiting out the backoff delay) or in flight.
+/// 'closed': ended intentionally — disconnect(), or the connection ended while
+/// reconnect.enabled was false.
+/// 'failed': automatic reconnect gave up — a non-retryable error, or reconnect.maxAttempts was
+/// reached. A fresh connect() is needed to try again.
+private enum ConnectionState: String {
+  case idle, connecting, open, reconnecting, closed, failed
+}
 
 private struct StreamState {
   var task: URLSessionDataTask?
@@ -48,10 +62,13 @@ private struct StreamState {
   var headers: [String: String]?
   var reconnectEnabled = true
   var reconnectIntervalMs = defaultReconnectIntervalMs
+  var maxIntervalMs = defaultMaxReconnectIntervalMs
+  var jitterFactor = defaultJitterFactor
   var reconnectMaxAttempts: Double?
   var reconnectAttempts = 0
   var pendingReconnect: DispatchWorkItem?
   var lastEventId: String?
+  var currentState: ConnectionState = .idle
   // By default, a 4xx response or a Content-Type mismatch does NOT trigger a reconnect (except
   // 429, always retried) — retrying an identical request usually just repeats the same failure.
   // Set true to retry every HTTP error, including 4xx.
@@ -114,7 +131,7 @@ class SSEBridgeClient: RCTEventEmitter {
   }
 
   override func supportedEvents() -> [String]! {
-    return ["onOpen", "onMessage", "onError", "onClose", "onMetrics"]
+    return ["onOpen", "onMessage", "onError", "onClose", "onMetrics", "onStateChange"]
   }
 
   override func startObserving() {
@@ -154,6 +171,8 @@ class SSEBridgeClient: RCTEventEmitter {
     let reconnectOptions = options["reconnect"] as? [String: Any]
     state.reconnectEnabled = (reconnectOptions?["enabled"] as? NSNumber)?.boolValue ?? true
     state.reconnectIntervalMs = (reconnectOptions?["intervalMs"] as? NSNumber)?.doubleValue ?? defaultReconnectIntervalMs
+    state.maxIntervalMs = (reconnectOptions?["maxIntervalMs"] as? NSNumber)?.doubleValue ?? defaultMaxReconnectIntervalMs
+    state.jitterFactor = (reconnectOptions?["jitterFactor"] as? NSNumber)?.doubleValue ?? defaultJitterFactor
     state.reconnectMaxAttempts = (reconnectOptions?["maxAttempts"] as? NSNumber)?.doubleValue
     state.retryOnClientError = (reconnectOptions?["retryOnClientError"] as? NSNumber)?.boolValue ?? false
 
@@ -167,7 +186,18 @@ class SSEBridgeClient: RCTEventEmitter {
     // performConnect directly, not through here) don't have it to hand.
     _ = sharedSession(options: options)
 
+    setState(streamId: streamId, .connecting)
     performConnect(streamId: streamId, isReconnect: false)
+  }
+
+  // Only fires onStateChange when the state actually changes — callers can transition through
+  // the same state repeatedly (e.g. scheduleReconnectIfNeeded on every failed attempt) without
+  // spamming duplicate events.
+  private func setState(streamId: String, _ newState: ConnectionState) {
+    guard streams[streamId]?.currentState != newState else { return }
+    streams[streamId]?.currentState = newState
+    guard hasListeners else { return }
+    sendEvent(withName: "onStateChange", body: ["streamId": streamId, "state": newState.rawValue])
   }
 
   private func performConnect(streamId: String, isReconnect: Bool) {
@@ -215,6 +245,7 @@ class SSEBridgeClient: RCTEventEmitter {
     streams[streamId]?.pendingReconnect?.cancel()
     let hadActiveTask = streams[streamId]?.task != nil
     endTask(for: streamId)
+    setState(streamId: streamId, .closed)
     streams[streamId] = nil
     if hadActiveTask, hasListeners {
       sendEvent(withName: "onClose", body: ["streamId": streamId])
@@ -245,6 +276,7 @@ class SSEBridgeClient: RCTEventEmitter {
 
     guard let httpResponse = response as? HTTPURLResponse else {
       streams[streamId]?.reconnectAttempts = 0
+      setState(streamId: streamId, .open)
       guard hasListeners else { return }
       sendEvent(withName: "onOpen", body: ["streamId": streamId])
       return
@@ -268,6 +300,7 @@ class SSEBridgeClient: RCTEventEmitter {
     }
 
     streams[streamId]?.reconnectAttempts = 0
+    setState(streamId: streamId, .open)
     guard hasListeners else { return }
     sendEvent(withName: "onOpen", body: ["streamId": streamId])
   }
@@ -384,18 +417,44 @@ class SSEBridgeClient: RCTEventEmitter {
   // connections" from "disconnect() was called" — disconnect() removes the entry entirely, so a
   // stale reconnect timer's closure finds nothing here and no-ops.
   private func scheduleReconnectIfNeeded(streamId: String, httpStatus: Int? = nil, wasContentTypeError: Bool = false) {
-    guard var state = streams[streamId], state.reconnectEnabled else { return }
-    guard isRetryableByDefault(streamId: streamId, httpStatus: httpStatus, wasContentTypeError: wasContentTypeError) else { return }
-    if let maxAttempts = state.reconnectMaxAttempts, Double(state.reconnectAttempts) >= maxAttempts { return }
+    guard var state = streams[streamId] else { return }
+    guard state.reconnectEnabled else {
+      setState(streamId: streamId, .closed)
+      return
+    }
+    guard isRetryableByDefault(streamId: streamId, httpStatus: httpStatus, wasContentTypeError: wasContentTypeError) else {
+      setState(streamId: streamId, .failed)
+      return
+    }
+    if let maxAttempts = state.reconnectMaxAttempts, Double(state.reconnectAttempts) >= maxAttempts {
+      setState(streamId: streamId, .failed)
+      return
+    }
+
+    let delayMs = nextReconnectDelayMs(state: state, attempt: state.reconnectAttempts)
     state.reconnectAttempts += 1
     streams[streamId] = state
+    setState(streamId: streamId, .reconnecting)
 
     let work = DispatchWorkItem { [weak self] in
       guard self?.streams[streamId] != nil else { return }
       self?.performConnect(streamId: streamId, isReconnect: true)
     }
     streams[streamId]?.pendingReconnect = work
-    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + state.reconnectIntervalMs / 1000, execute: work)
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delayMs / 1000, execute: work)
+  }
+
+  // Exponential backoff with jitter: delay doubles with each consecutive failed attempt, starting
+  // from reconnectIntervalMs (the base interval, or the server's last `retry:` value) and capped
+  // at maxIntervalMs, then randomized by jitterFactor to avoid many clients retrying in lockstep
+  // after a shared outage. `attempt` is 0 for the first scheduled reconnect (so it starts at
+  // exactly reconnectIntervalMs before jitter), 1 for the second (2x), 2 for the third (4x), etc.
+  private func nextReconnectDelayMs(state: StreamState, attempt: Int) -> Double {
+    let exponential = min(state.reconnectIntervalMs * pow(2, Double(attempt)), state.maxIntervalMs)
+    guard state.jitterFactor > 0 else { return exponential }
+    let spread = exponential * state.jitterFactor
+    let jittered = exponential - spread / 2 + Double.random(in: 0...spread)
+    return max(0, min(jittered, state.maxIntervalMs))
   }
 
   fileprivate func handleMetrics(taskId: Int, metrics: URLSessionTaskMetrics) {

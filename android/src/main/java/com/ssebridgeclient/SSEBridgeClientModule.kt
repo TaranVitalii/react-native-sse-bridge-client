@@ -30,12 +30,33 @@ import java.util.concurrent.TimeUnit
 
 private const val LOG_TAG = "BridgeSSE"
 private const val DEFAULT_RECONNECT_INTERVAL_MS = 3000.0
+private const val DEFAULT_MAX_RECONNECT_INTERVAL_MS = 30000.0
+private const val DEFAULT_JITTER_FACTOR = 0.5
 
 // Error responses (4xx/5xx) are typically small JSON/HTML bodies — bounded so a misbehaving
 // server streaming an enormous error page can't grow this unboundedly before completion.
 private const val MAX_ERROR_BODY_BYTES = 8192L
 
 private val METHODS_REQUIRING_BODY = setOf("POST", "PUT", "PATCH", "PROPPATCH", "REPORT")
+
+/**
+ * 'idle': never connected, or destroy()ed — the initial state.
+ * 'connecting': an explicit connect() call's first attempt is in flight.
+ * 'open': the connection is live, after onOpen.
+ * 'reconnecting': an automatic retry is pending (waiting out the backoff delay) or in flight.
+ * 'closed': ended intentionally — disconnect(), or the connection ended while
+ * reconnect.enabled was false.
+ * 'failed': automatic reconnect gave up — a non-retryable error, or reconnect.maxAttempts was
+ * reached. A fresh connect() is needed to try again.
+ */
+private enum class ConnectionState(val value: String) {
+  IDLE("idle"),
+  CONNECTING("connecting"),
+  OPEN("open"),
+  RECONNECTING("reconnecting"),
+  CLOSED("closed"),
+  FAILED("failed"),
+}
 
 private class CallTimings {
   var connectStart: Long? = null
@@ -88,10 +109,13 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     var headers: Map<String, String>? = null
     var reconnectEnabled = true
     var reconnectIntervalMs = DEFAULT_RECONNECT_INTERVAL_MS
+    var maxIntervalMs = DEFAULT_MAX_RECONNECT_INTERVAL_MS
+    var jitterFactor = DEFAULT_JITTER_FACTOR
     var reconnectMaxAttempts: Double? = null
     var reconnectAttempts = 0
     var pendingReconnect: Runnable? = null
     var lastEventId: String? = null
+    var currentState = ConnectionState.IDLE
     // By default, a 4xx response or a Content-Type mismatch does NOT trigger a reconnect (except
     // 429, always retried) — retrying an identical request usually just repeats the same failure.
     // Set true to retry every HTTP error, including 4xx.
@@ -228,6 +252,8 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     val reconnectOptions = options?.getMap("reconnect")
     state.reconnectEnabled = if (reconnectOptions?.hasKey("enabled") == true) reconnectOptions.getBoolean("enabled") else true
     state.reconnectIntervalMs = if (reconnectOptions?.hasKey("intervalMs") == true) reconnectOptions.getDouble("intervalMs") else DEFAULT_RECONNECT_INTERVAL_MS
+    state.maxIntervalMs = if (reconnectOptions?.hasKey("maxIntervalMs") == true) reconnectOptions.getDouble("maxIntervalMs") else DEFAULT_MAX_RECONNECT_INTERVAL_MS
+    state.jitterFactor = if (reconnectOptions?.hasKey("jitterFactor") == true) reconnectOptions.getDouble("jitterFactor") else DEFAULT_JITTER_FACTOR
     state.reconnectMaxAttempts = if (reconnectOptions?.hasKey("maxAttempts") == true) reconnectOptions.getDouble("maxAttempts") else null
     state.retryOnClientError = reconnectOptions?.hasKey("retryOnClientError") == true && reconnectOptions.getBoolean("retryOnClientError")
 
@@ -241,7 +267,24 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     // performConnect directly, not through here) don't have it to hand.
     sharedClient(options)
 
+    setState(streamId, ConnectionState.CONNECTING)
     performConnect(streamId, isReconnect = false)
+  }
+
+  // Only fires onStateChange when the state actually changes — callers can transition through
+  // the same state repeatedly (e.g. scheduleReconnectIfNeeded on every failed attempt) without
+  // spamming duplicate events.
+  private fun setState(streamId: String, newState: ConnectionState) {
+    val state = streams[streamId] ?: return
+    if (state.currentState == newState) return
+    state.currentState = newState
+    emitEvent(
+      "onStateChange",
+      Arguments.createMap().apply {
+        putString("streamId", streamId)
+        putString("state", newState.value)
+      }
+    )
   }
 
   private fun performConnect(streamId: String, isReconnect: Boolean) {
@@ -323,6 +366,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
         }
 
         streams[streamId]?.reconnectAttempts = 0
+        setState(streamId, ConnectionState.OPEN)
         emitEvent("onOpen", Arguments.createMap().apply { putString("streamId", streamId) })
         try {
           val source = response.body?.source()
@@ -438,16 +482,43 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
   // stale reconnect Runnable finds nothing here and no-ops.
   private fun scheduleReconnectIfNeeded(streamId: String, httpStatus: Int? = null, wasContentTypeError: Boolean = false) {
     val state = streams[streamId] ?: return
-    if (!state.reconnectEnabled) return
-    if (!isRetryableByDefault(streamId, httpStatus, wasContentTypeError)) return
-    state.reconnectMaxAttempts?.let { max -> if (state.reconnectAttempts >= max) return }
+    if (!state.reconnectEnabled) {
+      setState(streamId, ConnectionState.CLOSED)
+      return
+    }
+    if (!isRetryableByDefault(streamId, httpStatus, wasContentTypeError)) {
+      setState(streamId, ConnectionState.FAILED)
+      return
+    }
+    state.reconnectMaxAttempts?.let { max ->
+      if (state.reconnectAttempts >= max) {
+        setState(streamId, ConnectionState.FAILED)
+        return
+      }
+    }
+
+    val delayMs = nextReconnectDelayMs(state, state.reconnectAttempts)
     state.reconnectAttempts += 1
+    setState(streamId, ConnectionState.RECONNECTING)
 
     val runnable = Runnable {
       if (streams[streamId] != null) performConnect(streamId, isReconnect = true)
     }
     state.pendingReconnect = runnable
-    mainHandler.postDelayed(runnable, state.reconnectIntervalMs.toLong())
+    mainHandler.postDelayed(runnable, delayMs.toLong())
+  }
+
+  // Exponential backoff with jitter: delay doubles with each consecutive failed attempt, starting
+  // from reconnectIntervalMs (the base interval, or the server's last `retry:` value) and capped
+  // at maxIntervalMs, then randomized by jitterFactor to avoid many clients retrying in lockstep
+  // after a shared outage. `attempt` is 0 for the first scheduled reconnect (so it starts at
+  // exactly reconnectIntervalMs before jitter), 1 for the second (2x), 2 for the third (4x), etc.
+  private fun nextReconnectDelayMs(state: StreamState, attempt: Int): Double {
+    val exponential = minOf(state.reconnectIntervalMs * Math.pow(2.0, attempt.toDouble()), state.maxIntervalMs)
+    if (state.jitterFactor <= 0) return exponential
+    val spread = exponential * state.jitterFactor
+    val jittered = exponential - spread / 2 + Math.random() * spread
+    return jittered.coerceIn(0.0, state.maxIntervalMs)
   }
 
   @ReactMethod
@@ -457,6 +528,7 @@ class SSEBridgeClientModule(reactContext: ReactApplicationContext) :
     state.currentCall?.let { emitCloseMetrics(streamId, it) }
     val hadActiveCall = state.currentCall != null
     state.currentCall?.cancel()
+    setState(streamId, ConnectionState.CLOSED)
     streams.remove(streamId)
     if (hadActiveCall) {
       emitEvent("onClose", Arguments.createMap().apply { putString("streamId", streamId) })

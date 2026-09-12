@@ -53,18 +53,32 @@ export interface SSEConnectionMetrics {
 /**
  * Governs automatic reconnection after a connection ends for any reason (error, or the server
  * closing the stream) other than an explicit disconnect(). Mirrors the browser EventSource /
- * react-native-sse model: reconnect is on by default, at a flat interval the server can override
- * per-stream via an SSE `retry:` field (no exponential backoff).
+ * react-native-sse model, with exponential backoff + jitter layered on top (see intervalMs,
+ * maxIntervalMs, jitterFactor) rather than react-native-sse's flat delay.
  */
 export interface SSEReconnectOptions {
   /** Default true. */
   enabled?: boolean;
   /**
-   * Delay before the first/next reconnect attempt, in ms. Default 3000. A `retry:` field in the
+   * Base delay before the first reconnect attempt, in ms. Default 3000. A `retry:` field in the
    * stream overrides this for that stream's subsequent reconnects (until connect() is called
-   * again explicitly, which resets it back to this value).
+   * again explicitly, which resets it back to this value). Each consecutive failed attempt after
+   * the first doubles the delay (see maxIntervalMs, jitterFactor) — this is the starting point,
+   * not a flat per-attempt delay.
    */
   intervalMs?: number;
+  /**
+   * Cap on the exponential backoff delay, in ms. Default 30000. Once doubling from intervalMs
+   * would exceed this, the delay stays at this value for every subsequent attempt.
+   */
+  maxIntervalMs?: number;
+  /**
+   * Randomizes each computed backoff delay by this fraction (0.0-1.0), so e.g. a jitterFactor of
+   * 0.5 turns a computed 4000ms delay into a random value in [3000, 5000]. Default 0.5 — this
+   * spreads out reconnect attempts from many clients hitting the same outage at once ("thundering
+   * herd"), so they don't all retry in lockstep. 0 disables jitter (exact exponential delay).
+   */
+  jitterFactor?: number;
   /**
    * Stop reconnecting after this many consecutive failed attempts. Default undefined (retry
    * forever). Resets to 0 after any successful onOpen.
@@ -80,6 +94,27 @@ export interface SSEReconnectOptions {
    */
   retryOnClientError?: boolean;
 }
+
+/**
+ * 'idle': never connected, or destroy()ed — the initial state.
+ * 'connecting': an explicit connect() call's first attempt is in flight, before its first
+ * onOpen/onError.
+ * 'open': the connection is live, after onOpen.
+ * 'reconnecting': an automatic retry is pending (waiting out the backoff delay) or in flight,
+ * after the connection ended for a reason SSEReconnectOptions allows retrying.
+ * 'closed': ended intentionally — an explicit disconnect(), or the connection ended while
+ * reconnect.enabled was false.
+ * 'failed': automatic reconnect gave up on this connect() session — either a non-retryable error
+ * (see SSEReconnectOptions.retryOnClientError) or reconnect.maxAttempts was reached. A fresh
+ * connect() call is needed to try again.
+ */
+export type SSEConnectionState =
+  | 'idle'
+  | 'connecting'
+  | 'open'
+  | 'reconnecting'
+  | 'closed'
+  | 'failed';
 
 /**
  * The underlying URLSession (iOS) / OkHttpClient (Android) is shared by every SSEStream and,
@@ -174,6 +209,10 @@ interface NativeErrorPayload {
   statusCode?: number;
 }
 
+interface NativeStatePayload {
+  state: SSEConnectionState;
+}
+
 // Declared explicitly (rather than left to NativeEventEmitter's default generic) so
 // addListener()'s callback parameter is typed as our actual payload shape instead of the
 // permissive default `Object`.
@@ -181,7 +220,8 @@ type SSEBridgeEventArgs =
   | [NativeStreamPayload]
   | [NativeStreamPayload & NativeMessagePayload]
   | [NativeStreamPayload & NativeErrorPayload]
-  | [NativeStreamPayload & SSEConnectionMetrics];
+  | [NativeStreamPayload & SSEConnectionMetrics]
+  | [NativeStreamPayload & NativeStatePayload];
 
 interface SSEBridgeEventMap {
   onOpen: [NativeStreamPayload];
@@ -189,6 +229,7 @@ interface SSEBridgeEventMap {
   onError: [NativeStreamPayload & NativeErrorPayload];
   onClose: [NativeStreamPayload];
   onMetrics: [NativeStreamPayload & SSEConnectionMetrics];
+  onStateChange: [NativeStreamPayload & NativeStatePayload];
   [key: string]: SSEBridgeEventArgs;
 }
 
@@ -227,6 +268,10 @@ export class SSEStream {
   private errorListeners = new Set<(error: SSEError) => void>();
   private closeListeners = new Set<() => void>();
   private metricsListeners = new Set<(metrics: SSEConnectionMetrics) => void>();
+  private stateListeners = new Set<(state: SSEConnectionState) => void>();
+  // Tracked internally (regardless of whether the caller ever calls onStateChange()) so
+  // getState() has an answer synchronously, without a round-trip to native.
+  private cachedState: SSEConnectionState = 'idle';
   private nativeSubs: { remove: () => void }[];
   private destroyed = false;
   private connected = false;
@@ -278,6 +323,16 @@ export class SSEStream {
             connectionReused: body.connectionReused,
           };
           this.metricsListeners.forEach((cb) => cb(metrics));
+        },
+      ),
+      emitter.addListener(
+        'onStateChange',
+        (body: NativeStreamPayload & NativeStatePayload) => {
+          if (body.streamId !== this.id) {
+            return;
+          }
+          this.cachedState = body.state;
+          this.stateListeners.forEach((cb) => cb(body.state));
         },
       ),
     ];
@@ -398,6 +453,18 @@ export class SSEStream {
     );
   }
 
+  /** Fires on every connection-state transition — see SSEConnectionState. */
+  onStateChange(callback: (state: SSEConnectionState) => void): Unsubscribe {
+    this.stateListeners.add(callback);
+    return () => this.stateListeners.delete(callback);
+  }
+
+  /** The stream's current connection state — see SSEConnectionState. Always up to date; doesn't
+   * require an onStateChange() listener to be registered. */
+  getState(): SSEConnectionState {
+    return this.cachedState;
+  }
+
   /** Disconnects, drops all listeners, and unsubscribes from the shared native emitter. */
   destroy(): void {
     if (this.destroyed) return;
@@ -409,6 +476,7 @@ export class SSEStream {
     this.errorListeners.clear();
     this.closeListeners.clear();
     this.metricsListeners.clear();
+    this.stateListeners.clear();
   }
 }
 
