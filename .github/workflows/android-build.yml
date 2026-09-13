@@ -1,0 +1,73 @@
+name: Build Android
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/android-build.yml'
+      - 'example/android/**'
+      - 'android/**'
+      - '**/package-lock.json'
+      - '**/react-native.config.js'
+  # No path filter here (unlike the push trigger above): this check is required by branch
+  # protection on main, and a required check that never runs on a given PR leaves that PR
+  # permanently unmergeable. Always running on every PR keeps it reliable.
+  pull_request: {}
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Android Example App
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # example/ is a standalone package (its own package-lock.json, own node_modules) — it isn't
+      # an npm workspace of the root, and is wired to this library via react-native.config.js's
+      # manual `dependencies` entry rather than a package.json dependency, so installing at the
+      # root alone never populates it.
+      - name: Install example dependencies
+        working-directory: example
+        run: npm ci
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('example/android/**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Run Gradle build
+        working-directory: example/android
+        run: ./gradlew assembleDebug --no-daemon --build-cache
+
+      - name: Stop Gradle daemon
+        working-directory: example/android
+        run: ./gradlew --stop

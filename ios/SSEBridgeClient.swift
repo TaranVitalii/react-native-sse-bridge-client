@@ -89,7 +89,32 @@ private struct StreamState {
   var errorStatusCode: Int?
   var contentTypeError = false
   var errorBodyData = Data()
+
+  // onBeforeRequest support. Classic Native Modules have no built-in way to call into JS and
+  // await a Promise result the way Nitro's HybridObject callbacks can — so this is a hand-rolled
+  // round trip: performConnect() emits "onBeforeRequest" (with a globally unique requestId, see
+  // SSEBridgeClient.nextBeforeRequestId) instead of firing the request immediately; JS resolves
+  // its hook and calls back into provideRequestHeaders(streamId, requestId, headers), which fires
+  // the request only if awaitingBeforeRequestId still matches — i.e. this attempt hasn't been
+  // superseded by a newer connect()/reconnect (or disconnect()) in the meantime.
+  // pendingBeforeRequestIsReconnect remembers isReconnect across that gap, since
+  // provideRequestHeaders needs it to decide whether to send Last-Event-ID.
+  var hasBeforeRequestListener = false
+  // nil when not currently waiting on a round trip. requestId is handed out from a single
+  // process-wide counter (never reset, never reused) specifically so a stale timeout/
+  // provideRequestHeaders() callback from a superseded attempt can never coincidentally collide
+  // with a legitimately-current one — unlike a per-stream counter, which would reset to 0 (and
+  // so collide) every time a fresh StreamState replaces this one, e.g. across a disconnect() +
+  // reconnect().
+  var awaitingBeforeRequestId: Int?
+  var pendingBeforeRequestIsReconnect = false
+  var pendingBeforeRequestTimeout: DispatchWorkItem?
 }
+
+// If JS never calls provideRequestHeaders() back (a broken onBeforeRequest hook that never
+// resolves/rejects, or a JS-side bug), the request fires anyway after this long rather than
+// hanging the stream forever.
+private let beforeRequestTimeoutSeconds: Double = 10
 
 @objc(SSEBridgeClient)
 class SSEBridgeClient: RCTEventEmitter {
@@ -101,6 +126,8 @@ class SSEBridgeClient: RCTEventEmitter {
   private var streams: [String: StreamState] = [:]
   private var taskIdToStreamId: [Int: String] = [:]
   private var hasListeners = false
+  // Hands out globally unique onBeforeRequest round-trip IDs — see StreamState.awaitingBeforeRequestId.
+  private var nextBeforeRequestId = 0
 
   override init() {
     super.init()
@@ -131,7 +158,7 @@ class SSEBridgeClient: RCTEventEmitter {
   }
 
   override func supportedEvents() -> [String]! {
-    return ["onOpen", "onMessage", "onError", "onClose", "onMetrics", "onStateChange"]
+    return ["onOpen", "onMessage", "onError", "onClose", "onMetrics", "onStateChange", "onBeforeRequest"]
   }
 
   override func startObserving() {
@@ -157,6 +184,7 @@ class SSEBridgeClient: RCTEventEmitter {
     }
 
     streams[streamId]?.pendingReconnect?.cancel()
+    streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
     endTask(for: streamId)
 
     var state = StreamState()
@@ -180,6 +208,8 @@ class SSEBridgeClient: RCTEventEmitter {
     state.body = options["body"] as? String
     state.validateContentType = (options["validateContentType"] as? NSNumber)?.boolValue ?? true
 
+    state.hasBeforeRequestListener = (options["hasBeforeRequestListener"] as? NSNumber)?.boolValue ?? false
+
     streams[streamId] = state
     // `options` (session config) is only ever consulted on the very first connect() made across
     // ALL streams — see sharedSession(options:) — so it's fine that reconnects (which call
@@ -201,6 +231,61 @@ class SSEBridgeClient: RCTEventEmitter {
   }
 
   private func performConnect(streamId: String, isReconnect: Bool) {
+    guard streams[streamId]?.connectURL != nil else { return }
+
+    // Invalidates any previous attempt still waiting on onBeforeRequest — see
+    // provideRequestHeaders() and the timeout work item below.
+    streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
+    streams[streamId]?.pendingBeforeRequestTimeout = nil
+    streams[streamId]?.awaitingBeforeRequestId = nil
+
+    guard streams[streamId]?.hasBeforeRequestListener == true else {
+      // Common case: no hook registered — skip the round trip entirely and fire immediately.
+      fireRequest(streamId: streamId, isReconnect: isReconnect, extraHeaders: [:])
+      return
+    }
+
+    nextBeforeRequestId += 1
+    let requestId = nextBeforeRequestId
+    streams[streamId]?.awaitingBeforeRequestId = requestId
+    streams[streamId]?.pendingBeforeRequestIsReconnect = isReconnect
+    if hasListeners {
+      sendEvent(withName: "onBeforeRequest", body: ["streamId": streamId, "requestId": requestId])
+    }
+
+    let timeout = DispatchWorkItem { [weak self] in
+      guard let self, self.streams[streamId]?.awaitingBeforeRequestId == requestId else { return }
+      self.streams[streamId]?.awaitingBeforeRequestId = nil
+      self.streams[streamId]?.pendingBeforeRequestTimeout = nil
+      self.fireRequest(streamId: streamId, isReconnect: isReconnect, extraHeaders: [:])
+    }
+    streams[streamId]?.pendingBeforeRequestTimeout = timeout
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + beforeRequestTimeoutSeconds, execute: timeout)
+  }
+
+  @objc(setBeforeRequestEnabled:enabled:)
+  func setBeforeRequestEnabled(_ streamId: String, enabled: Bool) {
+    streams[streamId]?.hasBeforeRequestListener = enabled
+  }
+
+  // Called back by JS once its onBeforeRequest hook resolves (or throws — headers is nil/empty
+  // in that case, the request proceeds anyway rather than getting stuck). requestId must match
+  // awaitingBeforeRequestId: if a newer connect()/reconnect (or a disconnect()) has since
+  // superseded this attempt, this callback is stale and is dropped rather than firing an
+  // out-of-date request. requestId is a process-wide, never-reused counter (see
+  // nextBeforeRequestId), so a stale callback can never coincidentally match a legitimately
+  // current one.
+  @objc(provideRequestHeaders:requestId:headers:)
+  func provideRequestHeaders(_ streamId: String, requestId: NSNumber, headers: [String: String]?) {
+    guard streams[streamId]?.awaitingBeforeRequestId == requestId.intValue else { return }
+    streams[streamId]?.awaitingBeforeRequestId = nil
+    streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
+    streams[streamId]?.pendingBeforeRequestTimeout = nil
+    let isReconnect = streams[streamId]?.pendingBeforeRequestIsReconnect ?? false
+    fireRequest(streamId: streamId, isReconnect: isReconnect, extraHeaders: headers ?? [:])
+  }
+
+  private func fireRequest(streamId: String, isReconnect: Bool, extraHeaders: [String: String]) {
     guard let connectURL = streams[streamId]?.connectURL else { return }
 
     streams[streamId]?.byteBuffer.removeAll(keepingCapacity: false)
@@ -220,6 +305,11 @@ class SSEBridgeClient: RCTEventEmitter {
       for (key, value) in headers {
         request.setValue(value, forHTTPHeaderField: key)
       }
+    }
+    // onBeforeRequest's result is applied last, so it can override anything above — e.g.
+    // refreshing an Authorization header that connectHeaders set with a now-stale token.
+    for (key, value) in extraHeaders {
+      request.setValue(value, forHTTPHeaderField: key)
     }
     // Only sent on an automatic reconnect that has actually seen an id: field — an explicit
     // connect() always starts a fresh logical session (lastEventId is unset on a fresh StreamState).
@@ -243,6 +333,7 @@ class SSEBridgeClient: RCTEventEmitter {
   @objc(disconnect:)
   func disconnect(_ streamId: String) {
     streams[streamId]?.pendingReconnect?.cancel()
+    streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
     let hadActiveTask = streams[streamId]?.task != nil
     endTask(for: streamId)
     setState(streamId: streamId, .closed)

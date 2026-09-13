@@ -213,6 +213,10 @@ interface NativeStatePayload {
   state: SSEConnectionState;
 }
 
+interface NativeBeforeRequestPayload {
+  requestId: number;
+}
+
 // Declared explicitly (rather than left to NativeEventEmitter's default generic) so
 // addListener()'s callback parameter is typed as our actual payload shape instead of the
 // permissive default `Object`.
@@ -221,7 +225,8 @@ type SSEBridgeEventArgs =
   | [NativeStreamPayload & NativeMessagePayload]
   | [NativeStreamPayload & NativeErrorPayload]
   | [NativeStreamPayload & SSEConnectionMetrics]
-  | [NativeStreamPayload & NativeStatePayload];
+  | [NativeStreamPayload & NativeStatePayload]
+  | [NativeStreamPayload & NativeBeforeRequestPayload];
 
 interface SSEBridgeEventMap {
   onOpen: [NativeStreamPayload];
@@ -230,6 +235,7 @@ interface SSEBridgeEventMap {
   onClose: [NativeStreamPayload];
   onMetrics: [NativeStreamPayload & SSEConnectionMetrics];
   onStateChange: [NativeStreamPayload & NativeStatePayload];
+  onBeforeRequest: [NativeStreamPayload & NativeBeforeRequestPayload];
   [key: string]: SSEBridgeEventArgs;
 }
 
@@ -272,6 +278,10 @@ export class SSEStream {
   // Tracked internally (regardless of whether the caller ever calls onStateChange()) so
   // getState() has an answer synchronously, without a round-trip to native.
   private cachedState: SSEConnectionState = 'idle';
+  // A single hook, not a Set like the listeners above — merging multiple onBeforeRequest hooks'
+  // headers wouldn't have an obviously correct behavior, so (matching react-native-nitro-sse-
+  // client) this replaces any previously set hook rather than adding another one.
+  private beforeRequestHook?: () => Promise<Record<string, string>>;
   private nativeSubs: { remove: () => void }[];
   private destroyed = false;
   private connected = false;
@@ -335,6 +345,27 @@ export class SSEStream {
           this.stateListeners.forEach((cb) => cb(body.state));
         },
       ),
+      emitter.addListener(
+        'onBeforeRequest',
+        async (body: NativeStreamPayload & NativeBeforeRequestPayload) => {
+          if (body.streamId !== this.id) {
+            return;
+          }
+          let headers: Record<string, string> = {};
+          try {
+            headers = (await this.beforeRequestHook?.()) ?? {};
+          } catch {
+            // A hook that throws/rejects shouldn't block the request — proceed without the
+            // extra headers rather than leaving native waiting (it has its own timeout too, but
+            // there's no reason to wait for it here).
+          }
+          SSEBridgeClientNative.provideRequestHeaders(
+            this.id,
+            body.requestId,
+            headers,
+          );
+        },
+      ),
     ];
   }
 
@@ -363,6 +394,7 @@ export class SSEStream {
       session,
       eventTypes: Array.from(this.messageListeners.keys()),
       metricsEnabled: this.metricsListeners.size > 0,
+      hasBeforeRequestListener: this.beforeRequestHook != null,
     });
   }
 
@@ -463,6 +495,21 @@ export class SSEStream {
    * require an onStateChange() listener to be registered. */
   getState(): SSEConnectionState {
     return this.cachedState;
+  }
+
+  /** Awaited immediately before every request this stream makes — the initial connect() and
+   * every automatic reconnect alike — so it's the right place to refresh a short-lived auth
+   * token rather than letting a reconnect fire with a stale one. Whatever headers it resolves
+   * with are merged over the connect()-time headers (resolved values win on a key collision).
+   * Assigning replaces any previously set hook; assign undefined to remove it. */
+  set onBeforeRequest(
+    hook: (() => Promise<Record<string, string>>) | undefined,
+  ) {
+    this.beforeRequestHook = hook;
+    // Only meaningful once connected — before that, connect() reads beforeRequestHook itself.
+    if (this.connected) {
+      SSEBridgeClientNative.setBeforeRequestEnabled(this.id, hook != null);
+    }
   }
 
   /** Disconnects, drops all listeners, and unsubscribes from the shared native emitter. */

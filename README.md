@@ -77,6 +77,26 @@ stream.connect('https://your-server.example.com/chat/completions', {
 })
 ```
 
+### Refreshing headers before a request
+
+`onBeforeRequest` is awaited immediately before every request this stream makes — the initial
+`connect()` and every automatic reconnect alike — so it's the right place to refresh a short-lived
+auth token, rather than a reconnect firing (and getting rejected) with a stale one:
+
+```ts
+stream.onBeforeRequest = async () => {
+  const token = await getFreshAccessToken()
+  return { Authorization: `Bearer ${token}` }
+}
+
+stream.connect('https://your-server.example.com/events')
+```
+
+Whatever headers it resolves with are merged over the `connect()`-time `headers`, resolved values
+winning on a key collision — so a stream can rely entirely on `onBeforeRequest` for auth and skip
+`headers` altogether, as above. If the returned promise rejects, the request proceeds anyway
+without the extra headers (a broken token-refresh hook shouldn't block reconnecting outright).
+
 ## API
 
 ### `createSSEStream(): SSEStream`
@@ -100,6 +120,7 @@ Sets the shared session config (timeout, max connections per host) once, up fron
 | `onMetrics(callback: (metrics: SSEConnectionMetrics) => void): () => void` | Fires once per connection, when it ends — see below. Like `addEventListener`, whether this has any listener is pushed down natively; with none, the event is dropped before it crosses the bridge. |
 | `onStateChange(callback: (state: SSEConnectionState) => void): () => void` | Fires on every connection-state transition — see [Connection state](#connection-state) below. Only fires when the state actually changes. |
 | `getState(): SSEConnectionState` | The stream's current connection state — see [Connection state](#connection-state) below. Always up to date; doesn't require an `onStateChange` listener to be registered. |
+| `onBeforeRequest = hook` (settable property) | Awaited immediately before every request — the initial `connect()` and every automatic reconnect alike. See [Refreshing headers before a request](#refreshing-headers-before-a-request) above. Assigning replaces any previously set hook (unlike the other callbacks above, only one hook is meaningful at a time). |
 | `destroy(): void` | Disconnects, drops every listener, and unsubscribes from the shared native event emitter. Call this when you're done with the stream (e.g. on unmount). |
 
 ### Event-type filtering happens natively
@@ -261,6 +282,7 @@ reconnect.enabled: false, connection ends ──> closed
 - **iOS**: a single `URLSession` (not `.shared`) created once and reused for every `connect()`/`disconnect()` cycle across every stream, so the connection pool persists across reconnects. SSE framing is parsed by hand, byte-level, from the streamed response body — no third-party SSE library. Handshake/TLS timings come from `URLSessionTaskMetrics`.
 - **Android**: a single `OkHttpClient` created once, likewise reused across reconnects and streams. Requests go through `client.newCall(request).enqueue(...)` with the response body read and parsed manually — **not** through `okhttp-sse`'s `EventSource`, because `RealEventSource.connect()` internally does `client.newBuilder().eventListener(...)`, which silently replaces any `eventListenerFactory` you set on the client, making handshake timing impossible to observe through it. Handshake/TLS timings come from OkHttp's `EventListener`.
 - **Multiplexing**: classic Native Modules can't be instantiated per-JS-object the way a Nitro `HybridObject` can, so every native method takes a `streamId` (generated in JS) and every emitted event carries it back — the JS-side `SSEStream` class filters the shared event emitter down to just its own stream.
+- **`onBeforeRequest`**: the classic bridge has no built-in way for native to call into JS and await a Promise result the way Nitro's HybridObject callbacks can — `RCTEventEmitter` only sends events one-way (native → JS). This is worked around with a hand-rolled round trip: instead of firing a request immediately, native emits an `onBeforeRequest` event carrying a globally unique `requestId`; JS resolves the hook and calls a `provideRequestHeaders(streamId, requestId, headers)` method back into native, which only fires the request if `requestId` still matches the attempt it's currently waiting on (a newer `connect()`/reconnect/`disconnect()` in between makes it stale, and it's dropped). A 10-second native-side timeout fires the request anyway if JS never calls back, so a broken hook can't hang a stream forever.
 
 ## License
 
