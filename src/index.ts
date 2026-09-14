@@ -93,6 +93,23 @@ export interface SSEReconnectOptions {
    * 4xx.
    */
   retryOnClientError?: boolean;
+  /**
+   * Default true. While enabled, this stream watches the device's system-wide network
+   * reachability (NWPathMonitor on iOS, ConnectivityManager on Android) and, whenever it's
+   * offline:
+   * - an automatic reconnect that would otherwise start a backoff timer instead moves straight to
+   *   the 'paused' state (see SSEConnectionState) and waits — no point burning battery retrying
+   *   into a dead network:
+   * - a connection that's currently open (or a reconnect that's already in flight) is proactively
+   *   torn down and paused too, rather than waiting for the OS to eventually notice and time out.
+   * The instant connectivity returns, a paused stream reconnects immediately (bypassing the
+   * backoff delay) with a fresh attempt budget (reconnectAttempts resets to 0, so maxAttempts
+   * doesn't carry over a real connectivity gap). Only ever pauses a stream that would otherwise be
+   * reconnecting — an explicit connect() call always attempts regardless of network status. Set
+   * false to disable and let every reconnect go through the normal backoff/maxAttempts path
+   * unconditionally, matching pre-network-monitoring behavior.
+   */
+  monitorNetwork?: boolean;
 }
 
 /**
@@ -102,6 +119,9 @@ export interface SSEReconnectOptions {
  * 'open': the connection is live, after onOpen.
  * 'reconnecting': an automatic retry is pending (waiting out the backoff delay) or in flight,
  * after the connection ended for a reason SSEReconnectOptions allows retrying.
+ * 'paused': reconnecting is on hold because the device currently has no network connectivity —
+ * see SSEReconnectOptions.monitorNetwork. Resumes automatically (and immediately) the instant
+ * connectivity returns.
  * 'closed': ended intentionally — an explicit disconnect(), or the connection ended while
  * reconnect.enabled was false.
  * 'failed': automatic reconnect gave up on this connect() session — either a non-retryable error
@@ -113,6 +133,7 @@ export type SSEConnectionState =
   | 'connecting'
   | 'open'
   | 'reconnecting'
+  | 'paused'
   | 'closed'
   | 'failed';
 

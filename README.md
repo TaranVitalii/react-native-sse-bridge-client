@@ -48,7 +48,7 @@ stream.onClose(() => console.log('closed'))
 // fires once, when the connection closes (disconnect(), a superseding connect(), or a failure)
 stream.onMetrics(metrics => console.log('connection reused:', metrics.connectionReused))
 
-// state is 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed' | 'failed'
+// state is 'idle' | 'connecting' | 'open' | 'reconnecting' | 'paused' | 'closed' | 'failed'
 stream.onStateChange(state => console.log('state:', state))
 
 stream.connect('https://your-server.example.com/events', {
@@ -184,17 +184,30 @@ interface SSEReconnectOptions {
   // default (except 429, which always retries) — that class of failure usually means retrying
   // identically won't help. Set true to retry every HTTP error, including 4xx.
   retryOnClientError?: boolean
+  // Default true. Pauses reconnecting (instead of retrying into a dead network) whenever the
+  // device has no network connectivity at all, resuming immediately once it's back — see
+  // "Network-aware pause/resume" below.
+  monitorNetwork?: boolean
 }
 
 // 'idle': never connected, or destroy()ed — the initial state.
 // 'connecting': an explicit connect() call's first attempt is in flight.
 // 'open': the connection is live, after onOpen.
 // 'reconnecting': an automatic retry is pending (waiting out the backoff delay) or in flight.
+// 'paused': reconnecting is on hold — the device currently has no network connectivity. Resumes
+// automatically the instant connectivity returns.
 // 'closed': ended intentionally — disconnect(), or the connection ended while reconnect.enabled
 // was false.
 // 'failed': automatic reconnect gave up — a non-retryable error, or reconnect.maxAttempts was
 // reached. A fresh connect() is needed to try again.
-type SSEConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed' | 'failed'
+type SSEConnectionState =
+  | 'idle'
+  | 'connecting'
+  | 'open'
+  | 'reconnecting'
+  | 'paused'
+  | 'closed'
+  | 'failed'
 ```
 
 ### Configuring the shared session
@@ -246,12 +259,31 @@ Reconnecting is automatic by default, mirroring the browser `EventSource` model 
 - **Giving up**: set `reconnect.maxAttempts` to stop retrying after that many consecutive failures (default: retry forever). The counter resets to 0 after any successful `onOpen`. Giving up moves the stream to the `'failed'` state — see [Connection state](#connection-state) below.
 - **Client errors**: a 4xx response or a Content-Type mismatch (see `validateContentType`) does **not** trigger a reconnect by default — retrying an identical request against a 401/403/404/etc. usually just repeats the same failure. The one default exception is `429` (rate limited), which always retries. Set `reconnect.retryOnClientError: true` to retry every HTTP error, including 4xx. 5xx, network, and timeout errors always retry (subject to `maxAttempts`), regardless of this setting.
 - **Opting out**: `stream.connect(url, { reconnect: { enabled: false } })` disables it entirely — call `connect()` yourself (e.g. from `onError`/`onClose`) to drive reconnection your own way.
+- **Network awareness**: while offline, reconnecting pauses entirely rather than retrying into a dead network — see [Network-aware pause/resume](#network-aware-pauseresume) below.
 
 ```ts
 stream.connect(url, {
   reconnect: { intervalMs: 1000, maxIntervalMs: 20000, jitterFactor: 0.3, maxAttempts: 10 },
 })
 ```
+
+## Network-aware pause/resume
+
+By default (`reconnect.monitorNetwork: true`), each stream watches the device's system-wide network reachability (`NWPathMonitor` on iOS, `ConnectivityManager` on Android) — not just "did this particular request fail," but "does the device have any network connectivity at all":
+
+- Whenever the device is offline, a reconnect that would otherwise start a backoff timer moves to the `'paused'` state and waits instead — there's no point burning battery retrying into a network that isn't there.
+- A connection that's currently `'open'` (or a reconnect already in flight) is proactively torn down and paused too, rather than waiting for the OS to eventually notice and time out.
+- The instant connectivity returns, a paused stream reconnects immediately — bypassing the backoff delay — with a fresh attempt budget (`reconnectAttempts` resets to 0, so `maxAttempts` doesn't get consumed by a real connectivity gap that had nothing to do with the server).
+
+An explicit `connect()` call always attempts regardless of current network status — this only ever pauses a stream that would otherwise be *automatically reconnecting*. Set `reconnect.monitorNetwork: false` to disable and let every reconnect go through the normal backoff/`maxAttempts` path unconditionally, matching the library's behavior before this feature existed.
+
+```ts
+stream.connect(url, {
+  reconnect: { monitorNetwork: false }, // e.g. you already handle connectivity elsewhere
+})
+```
+
+On Android this requires the `android.permission.ACCESS_NETWORK_STATE` permission, which the library declares in its own manifest (merged into your app's automatically) — most React Native apps already have it via other dependencies.
 
 ## Connection state
 
@@ -263,17 +295,23 @@ idle ──connect()──> connecting ──onOpen──> open
                         │ (error/close)      │ (error/close)
                         ▼                    ▼
                     reconnecting <───────────┘
-                     │        │
-      (retryable,    │        │ (non-retryable, or
-       under          │        │  maxAttempts reached)
-       maxAttempts)   ▼        ▼
-                     open    failed
+                     │   │    │
+      (retryable,    │   │    │ (non-retryable, or
+       under          │   │    │  maxAttempts reached)
+       maxAttempts,   │   │    ▼
+       online)        │   │  failed
+                       │   │
+       (offline)       │   └──────────┐
+                       ▼               ▼
+                     open           paused ──(connectivity returns)──> reconnecting
 
 disconnect() (from any state) ──> closed
 reconnect.enabled: false, connection ends ──> closed
+offline while open/reconnecting (monitorNetwork) ──> paused
 ```
 
 - `'reconnecting'` covers both "waiting out the backoff delay" and "the retry attempt itself in flight" — it doesn't flip back to `'connecting'` for each individual attempt.
+- `'paused'` means reconnecting is on hold for lack of any network connectivity — see [Network-aware pause/resume](#network-aware-pauseresume) above. Resumes into `'reconnecting'` automatically.
 - `'failed'` is terminal for that logical session — a client error (`retryOnClientError` not set) or an exhausted `maxAttempts` gave up. Call `connect()` again to start a fresh session.
 - `onStateChange` only fires when the state actually changes — no duplicate events for repeated transitions into the same state.
 
@@ -283,6 +321,7 @@ reconnect.enabled: false, connection ends ──> closed
 - **Android**: a single `OkHttpClient` created once, likewise reused across reconnects and streams. Requests go through `client.newCall(request).enqueue(...)` with the response body read and parsed manually — **not** through `okhttp-sse`'s `EventSource`, because `RealEventSource.connect()` internally does `client.newBuilder().eventListener(...)`, which silently replaces any `eventListenerFactory` you set on the client, making handshake timing impossible to observe through it. Handshake/TLS timings come from OkHttp's `EventListener`.
 - **Multiplexing**: classic Native Modules can't be instantiated per-JS-object the way a Nitro `HybridObject` can, so every native method takes a `streamId` (generated in JS) and every emitted event carries it back — the JS-side `SSEStream` class filters the shared event emitter down to just its own stream.
 - **`onBeforeRequest`**: the classic bridge has no built-in way for native to call into JS and await a Promise result the way Nitro's HybridObject callbacks can — `RCTEventEmitter` only sends events one-way (native → JS). This is worked around with a hand-rolled round trip: instead of firing a request immediately, native emits an `onBeforeRequest` event carrying a globally unique `requestId`; JS resolves the hook and calls a `provideRequestHeaders(streamId, requestId, headers)` method back into native, which only fires the request if `requestId` still matches the attempt it's currently waiting on (a newer `connect()`/reconnect/`disconnect()` in between makes it stale, and it's dropped). A 10-second native-side timeout fires the request anyway if JS never calls back, so a broken hook can't hang a stream forever.
+- **Network monitoring**: one `NWPathMonitor`/`ConnectivityManager.NetworkCallback` per stream (not a shared/broadcast monitor across every stream) — simpler and safer, at the cost of one lightweight monitor per concurrent stream. Each monitor ignores its own *first* status callback (only establishes a baseline) before reacting to any *change* from it, specifically to avoid a false-immediate-restart bug the reference implementation (`react-native-nitro-sse`) hit and documented fixing in its own changelog.
 
 ## License
 
