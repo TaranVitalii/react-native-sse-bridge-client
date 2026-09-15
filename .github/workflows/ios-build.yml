@@ -84,6 +84,10 @@ jobs:
         working-directory: example/ios
         run: pod install
 
+      # This step only compiles (never launches a simulator), so a generic Simulator destination
+      # avoids depending on any specific device being predefined for the pinned Xcode version — a
+      # named device (e.g. 'iPhone 17') can vanish from `xcodebuild`'s device list the moment the
+      # runner's Xcode version doesn't happen to ship that device's definition, breaking every PR.
       - name: Build App
         working-directory: example/ios
         run: |
@@ -94,6 +98,6 @@ jobs:
             -scheme ReactNativeSSEBridgeClientExample \
             -sdk iphonesimulator \
             -configuration Debug \
-            -destination 'platform=iOS Simulator,name=iPhone 17' \
+            -destination 'generic/platform=iOS Simulator' \
             build \
             CODE_SIGNING_ALLOWED=NO | xcpretty
