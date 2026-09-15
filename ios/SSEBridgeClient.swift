@@ -124,6 +124,16 @@ private struct StreamState {
   // that happens to start while already offline doesn't immediately pause a connect() that hasn't
   // even been attempted yet.
   var hasNetworkConnectivity: Bool?
+
+  // Heartbeat watchdog (SSEReconnectOptions.heartbeatTimeoutMs). A self-resetting "dead man's
+  // switch": every data chunk received (including bytes that are part of a bare `:` heartbeat
+  // comment, which never reaches parseAndEmit as a message) reschedules this via
+  // resetHeartbeatWatchdog() — if it ever actually fires, no data of any kind arrived within the
+  // window, so the connection is presumed dead.
+  var heartbeatTimeoutMs: Double?
+  var heartbeatWatchdog: DispatchWorkItem?
+
+  var autoParseJSON = false
 }
 
 // If JS never calls provideRequestHeaders() back (a broken onBeforeRequest hook that never
@@ -201,6 +211,11 @@ class SSEBridgeClient: RCTEventEmitter {
     streams[streamId]?.pendingReconnect?.cancel()
     streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
     streams[streamId]?.networkMonitor?.cancel()
+    // Without this, a stale watchdog from the OLD StreamState (about to be discarded below) could
+    // still fire after the new StreamState/task are in place — handleHeartbeatTimeout(streamId:)
+    // looks up streams[streamId] fresh, so it would incorrectly kill the brand new connection
+    // instead of silently no-oping against an already-gone state.
+    streams[streamId]?.heartbeatWatchdog?.cancel()
     endTask(for: streamId)
 
     var state = StreamState()
@@ -227,6 +242,8 @@ class SSEBridgeClient: RCTEventEmitter {
     state.hasBeforeRequestListener = (options["hasBeforeRequestListener"] as? NSNumber)?.boolValue ?? false
 
     state.monitorNetworkEnabled = (reconnectOptions?["monitorNetwork"] as? NSNumber)?.boolValue ?? true
+    state.heartbeatTimeoutMs = (reconnectOptions?["heartbeatTimeoutMs"] as? NSNumber)?.doubleValue
+    state.autoParseJSON = (options["autoParseJSON"] as? NSNumber)?.boolValue ?? false
 
     streams[streamId] = state
     // `options` (session config) is only ever consulted on the very first connect() made across
@@ -285,6 +302,7 @@ class SSEBridgeClient: RCTEventEmitter {
     streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
     streams[streamId]?.pendingBeforeRequestTimeout = nil
     streams[streamId]?.awaitingBeforeRequestId = nil
+    stopHeartbeatWatchdog(streamId: streamId)
     let hadActiveTask = streams[streamId]?.task != nil
     endTask(for: streamId)
     streams[streamId]?.task = nil
@@ -301,6 +319,48 @@ class SSEBridgeClient: RCTEventEmitter {
           state.currentState == .paused else { return }
     streams[streamId]?.reconnectAttempts = 0
     performConnect(streamId: streamId, isReconnect: true)
+  }
+
+  // Cancels any pending watchdog and, if heartbeatTimeoutMs is set, schedules a fresh one — call
+  // this on every sign of life (the first onOpen, and every subsequent data chunk) to keep
+  // pushing the deadline out. Left disabled (no-op beyond the cancel) when heartbeatTimeoutMs is
+  // nil, which is the default.
+  private func resetHeartbeatWatchdog(streamId: String) {
+    streams[streamId]?.heartbeatWatchdog?.cancel()
+    streams[streamId]?.heartbeatWatchdog = nil
+    guard let timeoutMs = streams[streamId]?.heartbeatTimeoutMs else { return }
+    let work = DispatchWorkItem { [weak self] in
+      self?.handleHeartbeatTimeout(streamId: streamId)
+    }
+    streams[streamId]?.heartbeatWatchdog = work
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutMs / 1000, execute: work)
+  }
+
+  private func stopHeartbeatWatchdog(streamId: String) {
+    streams[streamId]?.heartbeatWatchdog?.cancel()
+    streams[streamId]?.heartbeatWatchdog = nil
+  }
+
+  // Only ever runs if nothing else already ended this connection first (a real completion/error,
+  // or disconnect()/a superseding connect() — all of which cancel this work item outright, so a
+  // stale watchdog from an already-ended connection can never reach here). Treated exactly like
+  // any other transport failure: torn down and reported synchronously here, same as disconnect()
+  // does.
+  private func handleHeartbeatTimeout(streamId: String) {
+    guard let task = streams[streamId]?.task else { return }
+    streams[streamId]?.task = nil
+    task.cancel()
+    let timeoutMs = streams[streamId]?.heartbeatTimeoutMs ?? 0
+    NSLog("[Bridge SSE][iOS][%@] heartbeat timeout — no data for %.0fms, treating connection as dead", streamId, timeoutMs)
+    if hasListeners {
+      sendEvent(withName: "onError", body: [
+        "streamId": streamId,
+        "message": "No data received for \(Int(timeoutMs))ms — connection appears dead",
+        "type": "timeout",
+      ])
+      sendEvent(withName: "onClose", body: ["streamId": streamId])
+    }
+    scheduleReconnectIfNeeded(streamId: streamId)
   }
 
   // Only fires onStateChange when the state actually changes — callers can transition through
@@ -417,6 +477,7 @@ class SSEBridgeClient: RCTEventEmitter {
   func disconnect(_ streamId: String) {
     streams[streamId]?.pendingReconnect?.cancel()
     streams[streamId]?.pendingBeforeRequestTimeout?.cancel()
+    stopHeartbeatWatchdog(streamId: streamId)
     let hadActiveTask = streams[streamId]?.task != nil
     endTask(for: streamId)
     stopNetworkMonitoring(streamId: streamId)
@@ -452,6 +513,7 @@ class SSEBridgeClient: RCTEventEmitter {
     guard let httpResponse = response as? HTTPURLResponse else {
       streams[streamId]?.reconnectAttempts = 0
       setState(streamId: streamId, .open)
+      resetHeartbeatWatchdog(streamId: streamId)
       guard hasListeners else { return }
       sendEvent(withName: "onOpen", body: ["streamId": streamId])
       return
@@ -476,6 +538,7 @@ class SSEBridgeClient: RCTEventEmitter {
 
     streams[streamId]?.reconnectAttempts = 0
     setState(streamId: streamId, .open)
+    resetHeartbeatWatchdog(streamId: streamId)
     guard hasListeners else { return }
     sendEvent(withName: "onOpen", body: ["streamId": streamId])
   }
@@ -486,6 +549,7 @@ class SSEBridgeClient: RCTEventEmitter {
     // current one, so a superseded connection's late-arriving data can't get appended into the
     // new connection's (already-reset) byteBuffer.
     guard streams[streamId]?.task?.taskIdentifier == taskId else { return }
+    resetHeartbeatWatchdog(streamId: streamId)
 
     if streams[streamId]?.errorStatusCode != nil || streams[streamId]?.contentTypeError == true {
       let currentSize = streams[streamId]?.errorBodyData.count ?? 0
@@ -593,6 +657,13 @@ class SSEBridgeClient: RCTEventEmitter {
   // stale reconnect timer's closure finds nothing here and no-ops.
   private func scheduleReconnectIfNeeded(streamId: String, httpStatus: Int? = nil, wasContentTypeError: Bool = false) {
     guard var state = streams[streamId] else { return }
+    // Called from every connection-ending path (HTTP error, content-type error, a network error,
+    // a normal close) via handleCompletion — stopping here, not just at the top of the next
+    // connect(), matters because streams[streamId]?.task is NOT nilled before this runs in every
+    // path: a watchdog left running past this point could still fire during the reconnect delay,
+    // spuriously re-reporting onError/onClose (or even re-entering this function) for a
+    // connection that already ended.
+    stopHeartbeatWatchdog(streamId: streamId)
     guard state.reconnectEnabled else {
       setState(streamId: streamId, .closed)
       return
@@ -718,10 +789,30 @@ class SSEBridgeClient: RCTEventEmitter {
       return
     }
 
-    var body: [String: Any] = ["streamId": streamId, "data": dataLines.joined(separator: "\n")]
+    let joinedData = dataLines.joined(separator: "\n")
+    var body: [String: Any] = ["streamId": streamId, "data": joinedData]
     if let id { body["id"] = id }
     if let eventName { body["event"] = eventName }
+    if state.autoParseJSON, let parsedData = Self.tryParseJSONObject(joinedData) {
+      body["parsedData"] = parsedData
+    }
     sendEvent(withName: "onMessage", body: body)
+  }
+
+  // Best-effort — any parse failure (invalid JSON, or a top-level value that isn't a JSON
+  // object, e.g. a bare array/string/number) is swallowed and reported as "not parsed" rather
+  // than as an error, since malformed data on one message shouldn't disrupt the stream.
+  // JSONSerialization's result is already RN-bridge-compatible as-is (NSDictionary/NSArray/
+  // NSString/NSNumber/NSNull) — unlike the Nitro version of this library, no AnyMap/manual
+  // conversion is needed here; the classic bridge already knows how to serialize plain
+  // Foundation collections directly as a sendEvent(body:) value.
+  private static func tryParseJSONObject(_ text: String) -> [String: Any]? {
+    guard let utf8 = text.data(using: .utf8),
+          let jsonObject = try? JSONSerialization.jsonObject(with: utf8),
+          let dictionary = jsonObject as? [String: Any] else {
+      return nil
+    }
+    return dictionary
   }
 }
 
